@@ -468,7 +468,10 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 		auto& inst = result.instructions.emplace_back();
 		Decoder::DecodeInstruction(front, front_words, inst);
 		front_words += inst.word_count;
-		if (inst.opcode == Decoder::Opcode::S_SETPC_B64) {
+		// The merged-stage ABI hands the back shader over in s[6:7]; depending on
+		// the compiler this is s_setpc_b64 s[6:7] or s_swappc_b64 null, s[6:7].
+		if (inst.opcode == Decoder::Opcode::S_SETPC_B64 ||
+		    inst.opcode == Decoder::Opcode::S_SWAPPC_B64) {
 			EXIT_NOT_IMPLEMENTED(inst.src0.kind != Decoder::OperandKind::Sgpr ||
 			                     inst.src0.reg != 6u);
 			break;
@@ -476,7 +479,8 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 		EXIT_NOT_IMPLEMENTED(inst.opcode == Decoder::Opcode::S_ENDPGM);
 	}
 	EXIT_IF(result.instructions.empty() ||
-	        result.instructions.back().opcode != Decoder::Opcode::S_SETPC_B64);
+	        (result.instructions.back().opcode != Decoder::Opcode::S_SETPC_B64 &&
+	         result.instructions.back().opcode != Decoder::Opcode::S_SWAPPC_B64));
 	joined_code.assign(front.begin(), front.begin() + front_words);
 	joined_code.insert(joined_code.end(), back.begin(), back.end());
 	// The merged-stage ABI passes the back shader in s[6:7]. Give that handoff an
@@ -517,9 +521,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		                                 .count());
 	};
 
-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " code_words=%" PRIu64 " decode\n",
+	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " code_words=%" PRIu64
+	     " back_words=%" PRIu64 " decode\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
-	     static_cast<uint64_t>(code.size()));
+	     static_cast<uint64_t>(code.size()), static_cast<uint64_t>(options.back_code.size()));
 
 	Decoder::Program decoded;
 	std::vector<uint32_t> joined_code;
