@@ -14,6 +14,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +28,33 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
+
+// Opt-in readback profile (KYTY_READBACK_LOG=1): GPU-dirty downloads and the wall time spent
+// waiting for the GPU queue inside them. KYTY_SKIP_READBACK=1 (diagnostic only) skips the
+// wait, leaving the guest copy possibly stale; used to measure the CPU-side ceiling.
+void RecordReadbackWait(double wait_ms) {
+	static const bool enabled = std::getenv("KYTY_READBACK_LOG") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	static auto     window_start = std::chrono::steady_clock::now();
+	static uint64_t count        = 0;
+	static double   total_ms     = 0.0;
+	static double   max_ms       = 0.0;
+	count++;
+	total_ms = total_ms + wait_ms;
+	max_ms   = std::max(max_ms, wait_ms);
+	const auto now     = std::chrono::steady_clock::now();
+	const auto elapsed = std::chrono::duration<double>(now - window_start).count();
+	if (elapsed >= 1.0) {
+		LOGF("Readback: count=%llu wait=%.0f ms/s max=%.0f ms\n",
+		     static_cast<unsigned long long>(count), total_ms, max_ms);
+		window_start = now;
+		count        = 0;
+		total_ms     = 0.0;
+		max_ms       = 0.0;
+	}
+}
 
 } // namespace
 
@@ -253,9 +281,16 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
 
 		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
-			const auto tick = m_scheduler.CurrentTick();
-			m_scheduler.Wait(tick);
-			m_scheduler.WaitPriorityOperations(tick);
+			const auto wait_begin = std::chrono::steady_clock::now();
+			if (std::getenv("KYTY_SKIP_READBACK") == nullptr) {
+				const auto tick = m_scheduler.CurrentTick();
+				m_scheduler.Wait(tick);
+				m_scheduler.WaitPriorityOperations(tick);
+			}
+			RecordReadbackWait(
+			    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+			                                              wait_begin)
+			        .count());
 			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
 		}
 		if (is_write) {
@@ -586,6 +621,9 @@ void BufferCache::RequestForcedCollection() {
 }
 
 void BufferCache::RunGarbageCollector(bool force) {
+	if (std::getenv("KYTY_NO_GC") != nullptr) {
+		return;
+	}
 	force           = force || m_force_collection_requested.exchange(false);
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {

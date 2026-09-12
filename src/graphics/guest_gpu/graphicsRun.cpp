@@ -943,8 +943,18 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
                                       const volatile void* address, uint32_t count_in_dwords) {
-	if (wait_op != 0) {
-		BufferFlushAndWait();
+	// wait_op only needs a CPU-side drain when this packet will read a value that
+	// may still be owned by the host GPU. Predicate-disable packets have no value
+	// to read, and CPU-current predicates must not serialize the whole pipeline.
+	if (wait_op != 0 && address != nullptr) {
+		const auto vaddr = reinterpret_cast<uint64_t>(address);
+		const bool buffer_dirty =
+		    m_renderer.GetBufferCache().HasGpuDirtyBytes(vaddr, sizeof(uint64_t));
+		const bool image_dirty =
+		    m_renderer.GetTextureCache().IsRegionGpuModified(vaddr, sizeof(uint64_t));
+		if (buffer_dirty || image_dirty) {
+			BufferFlushAndWait();
+		}
 	}
 
 	(void)count_in_dwords;

@@ -221,12 +221,13 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr uint64_t GiB = 1024ull * 1024 * 1024;
-		// Base the target on the size of the device-local heap instead of the free memory the
-		// driver reports: the free number collapses towards zero as the heap fills, which moved
-		// every threshold down exactly when eviction was needed, so the resident set rode the
-		// wall until images had to be served from system memory.
-		constexpr uint64_t desktop_reserve = GiB + GiB / 2;
-		const auto         heap            = m_graphics.GetDeviceLocalHeapSize();
+		// Desktop reserve by default; KYTY_VRAM_RESERVE_MIB overrides it for experiments.
+		uint64_t desktop_reserve = GiB + GiB / 2;
+		if (const char* reserve_mib = std::getenv("KYTY_VRAM_RESERVE_MIB")) {
+			desktop_reserve =
+			    static_cast<uint64_t>(std::strtoull(reserve_mib, nullptr, 10)) * 1024 * 1024;
+		}
+		const auto heap = m_graphics.GetDeviceLocalHeapSize();
 		if (heap > desktop_reserve + 2 * GiB) {
 			const auto target    = heap - desktop_reserve;
 			m_critical_gc_memory = target - target / 8;
@@ -2030,6 +2031,9 @@ void TextureCache::RequestForcedCollection() {
 
 void TextureCache::RunGarbageCollector(bool force) {
 	ExternalTransferCounters::ReportIfEnabled();
+	if (std::getenv("KYTY_NO_GC") != nullptr) {
+		return;
+	}
 	std::scoped_lock lock {m_lock};
 	force = force || m_force_collection_requested.exchange(false);
 	const uint64_t   tick = m_gc_tick++;
