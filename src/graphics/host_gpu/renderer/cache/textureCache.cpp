@@ -20,7 +20,10 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
+#include <atomic>
+#include <chrono>
 #include <limits>
 #include <mutex>
 #include <span>
@@ -166,6 +169,48 @@ void NameImageBinding(GraphicContext& graphics, Image& image, vk::ImageView view
 }
 
 } // namespace
+
+// Guest-visible texture transfers, reported once per second with KYTY_XFER_LOG=1. Large
+// upload/download volumes are the signature of cache thrash (evict + re-fetch per frame).
+namespace ExternalTransferCounters {
+static std::atomic<uint64_t> g_upload_calls {0};
+static std::atomic<uint64_t> g_upload_bytes {0};
+static std::atomic<uint64_t> g_download_calls {0};
+static std::atomic<uint64_t> g_download_bytes {0};
+
+void Upload(uint64_t bytes) {
+	g_upload_calls.fetch_add(1);
+	g_upload_bytes.fetch_add(bytes);
+}
+
+void Download(uint64_t bytes) {
+	g_download_calls.fetch_add(1);
+	g_download_bytes.fetch_add(bytes);
+}
+
+void ReportIfEnabled() {
+	static const bool enabled = std::getenv("KYTY_XFER_LOG") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	static auto last    = std::chrono::steady_clock::now();
+	const auto  now     = std::chrono::steady_clock::now();
+	const auto  elapsed = std::chrono::duration<double>(now - last).count();
+	if (elapsed < 1.0) {
+		return;
+	}
+	const auto upload_bytes   = g_upload_bytes.exchange(0);
+	const auto upload_calls   = g_upload_calls.exchange(0);
+	const auto download_bytes = g_download_bytes.exchange(0);
+	const auto download_calls = g_download_calls.exchange(0);
+	LOGF("Xfer: upload=%.1f MB/s (%llu calls) download=%.1f MB/s (%llu calls)\n",
+	     static_cast<double>(upload_bytes) / elapsed / 1048576.0,
+	     static_cast<unsigned long long>(upload_calls),
+	     static_cast<double>(download_bytes) / elapsed / 1048576.0,
+	     static_cast<unsigned long long>(download_calls));
+	last = now;
+}
+} // namespace ExternalTransferCounters
 
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
                            PageManager& page_manager, BufferCache& buffer_cache)
@@ -1036,6 +1081,7 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
 	const auto& info    = image.info;
+	ExternalTransferCounters::Upload(info.data.size);
 	const auto  binding = UploadBinding(image);
 	const auto  upload  = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
 		for (auto& copy: copies) {
@@ -1675,6 +1721,7 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 
 void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
                                      uint64_t destination_size, ImageDownload transfer) {
+	ExternalTransferCounters::Download(destination_size);
 	if (!transfer.valid) {
 		EXIT("TextureCache: invalid image download transfer\n");
 	}
@@ -1982,6 +2029,7 @@ void TextureCache::RequestForcedCollection() {
 }
 
 void TextureCache::RunGarbageCollector(bool force) {
+	ExternalTransferCounters::ReportIfEnabled();
 	std::scoped_lock lock {m_lock};
 	force = force || m_force_collection_requested.exchange(false);
 	const uint64_t   tick = m_gc_tick++;

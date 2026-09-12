@@ -23,6 +23,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdlib>
 #include <list>
 #include <thread>
 #include <vector>
@@ -775,6 +777,33 @@ void VideoOutDriver::Impl::VblankEnd() {
 	}
 }
 
+// Opt-in pacing report (KYTY_FPS_LOG=1): presented flips per second plus the largest gap
+// between presents (stutter) once per second. Flips are the frames the game actually
+// completes, so this measures the guest's frame delivery rather than vblank ticks.
+static void RecordPresentedFrame() {
+	static const bool enabled = std::getenv("KYTY_FPS_LOG") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	static auto     window_start = std::chrono::steady_clock::now();
+	static auto     last         = window_start;
+	static uint64_t frames       = 0;
+	static double   max_gap_ms   = 0.0;
+	const auto      now          = std::chrono::steady_clock::now();
+	const auto      gap_ms = std::chrono::duration<double, std::milli>(now - last).count();
+	last                   = now;
+	max_gap_ms             = std::max(max_gap_ms, gap_ms);
+	frames++;
+	const auto elapsed = std::chrono::duration<double>(now - window_start).count();
+	if (elapsed >= 1.0) {
+		LOGF("Present: fps=%.1f maxgap=%.1f ms\n", static_cast<double>(frames) / elapsed,
+		     max_gap_ms);
+		frames       = 0;
+		max_gap_ms   = 0.0;
+		window_start = now;
+	}
+}
+
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
@@ -809,6 +838,9 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 		VblankBegin();
 		bool presented = m_flip_queue.Flip(0);
+		if (presented) {
+			RecordPresentedFrame();
+		}
 		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
 			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
 				m_presenter.Present(*frame, true);
