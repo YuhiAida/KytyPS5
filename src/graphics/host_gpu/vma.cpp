@@ -136,9 +136,29 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
+	auto              result      = static_cast<vk::Result>(
 	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
 	                   &alloc_info, &native_image, &image.allocation, nullptr));
+	if (result != vk::Result::eSuccess) {
+		// A title whose resident set exceeds the device heap must not fail outright:
+		// retry in whatever memory the driver offers (normally system RAM). Rendering
+		// from system memory is slower but keeps the frame alive.
+		VmaAllocationCreateInfo fallback {};
+		fallback.requiredFlags  = 0;
+		fallback.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		const auto retry        = static_cast<vk::Result>(
+		    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
+		                   &fallback, &native_image, &image.allocation, nullptr));
+		static size_t fallback_count = 0;
+		if (retry == vk::Result::eSuccess) {
+			if (fallback_count++ < 16) {
+				LOGF("image %ux%u format=%d served from fallback memory (device heap full)\n",
+				     image_info.extent.width, image_info.extent.height,
+				     static_cast<int>(image_info.format));
+			}
+			result = retry;
+		}
+	}
 	image.image = native_image;
 	if (result != vk::Result::eSuccess) {
 		LogMemoryBudget();

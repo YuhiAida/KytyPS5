@@ -125,12 +125,34 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 			DepthFatal("invalid depth view: base=%u last=%u", z.depth_view.slice_start,
 			           z.depth_view.slice_max);
 	}
-	if (z.z_info.expclear_enabled || z.stencil_info.expclear_enabled ||
-	    z.z_info.partially_resident ||
-	    z.stencil_info.partially_resident || z.z_info.max_mip_level != 0 ||
-	    z.depth_view.current_mip_level != 0 || unsupported_shading_rate_encoding ||
-	    depth_address == 0 || (depth_address & 0xffffu) != 0) {
-		DepthFatal("unsupported depth register state");
+	// Expand-clear (DB_Z_INFO bit 27) asks the DB to materialise tiles whose HTILE
+	// metadata still holds a clear value. Kyty renders against real depth data and
+	// never expands metadata, so the flag only announces an optimisation: accept
+	// the target instead of refusing it, and keep failing on the states that Kyty
+	// genuinely cannot render.
+	const bool expand_clear = z.z_info.expclear_enabled || z.stencil_info.expclear_enabled;
+	if (expand_clear) {
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("DepthTarget: expand-clear target accepted (z=%u stencil=%u htile=%u "
+			     "addr=0x%llx)\n",
+			     z.z_info.expclear_enabled ? 1u : 0u, z.stencil_info.expclear_enabled ? 1u : 0u,
+			     z.z_info.htile_acceleration ? 1u : 0u,
+			     static_cast<unsigned long long>(depth_address));
+		}
+	}
+	if (z.z_info.partially_resident || z.stencil_info.partially_resident ||
+	    z.z_info.max_mip_level != 0 || z.depth_view.current_mip_level != 0 ||
+	    unsupported_shading_rate_encoding || depth_address == 0 ||
+	    (depth_address & 0xffffu) != 0) {
+		DepthFatal("unsupported depth register state: expand-clear=%u resident=%u/%u max_mip=%u "
+		           "mip=%u rate=%u z_addr=0x%llx",
+		           expand_clear ? 1u : 0u, z.z_info.partially_resident ? 1u : 0u,
+		           z.stencil_info.partially_resident ? 1u : 0u,
+		           static_cast<unsigned>(z.z_info.max_mip_level),
+		           static_cast<unsigned>(z.depth_view.current_mip_level),
+		           static_cast<unsigned>(z.shading_rate_encoding),
+		           static_cast<unsigned long long>(depth_address));
 	}
 	if (has_stencil) {
 		if (z.stencil_info.format != Prospero::StencilFormat::k8UInt || !htile_stencil_compat ||

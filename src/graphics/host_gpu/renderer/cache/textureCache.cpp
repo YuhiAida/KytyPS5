@@ -1770,7 +1770,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	return true;
 }
 
-bool TextureCache::DownloadImageMemory(ImageId id) {
+bool TextureCache::DownloadImageMemory(ImageId id, bool best_effort) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
 		return false;
@@ -1784,6 +1784,11 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	auto [mapped, offset] =
 	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
 	if (mapped == nullptr) {
+		// A collector-driven download must not fail the frame: the buffer may be
+		// busy with in-flight work or smaller than this image.
+		if (best_effort) {
+			return false;
+		}
 		EXIT("TextureCache: failed to map reusable download buffer\n");
 	}
 	download.Commit();
@@ -1980,8 +1985,12 @@ void TextureCache::RunGarbageCollector() {
 	const auto collect = [&](bool allow_aggressive) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
-		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
+		// A title that streams more than the device budget cannot be protected by a
+		// wide "recently used" window: keep only what the current frame touches
+		// (streamed textures are re-uploadable from guest memory) and collect more
+		// per pass so the heap stays inside its budget instead of spilling.
+		const uint64_t age       = std::min<uint64_t>(aggressive ? 4 : pressured ? 16 : 64, tick);
+		size_t         deletions = aggressive ? 512 : pressured ? 128 : 32;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
@@ -2001,13 +2010,14 @@ void TextureCache::RunGarbageCollector() {
 			}
 			if (owner->IsGpuModified()) {
 				const bool safe = SafeToDownload(*owner);
-				if (safe && owner->info.IsTiled()) {
-					continue;
-				}
+				// GPU-written tiled images used to be kept forever, so the resident set
+				// could only grow until the device heap ran out. When under pressure,
+				// download them first (tiling is handled by the texture transfer) and
+				// release the VRAM; images touched by the current frame stay cached.
 				if (safe && !pressured) {
 					continue;
 				}
-				if (safe && !DownloadImageMemory(id)) {
+				if (safe && !DownloadImageMemory(id, true)) {
 					continue;
 				}
 			}
