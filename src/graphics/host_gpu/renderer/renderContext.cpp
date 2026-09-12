@@ -28,6 +28,12 @@ void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 	EXIT_IF(m_gpu != nullptr);
 	m_video_out = video_out;
 	m_gpu       = std::make_unique<GuestGpu>(*this);
+	// Device-local allocations that fail ask the caches for a forced sweep instead of quietly
+	// spilling the resident set into system memory.
+	m_graphics.SetMemoryPressureHandler([this] {
+		m_texture_cache.RequestForcedCollection();
+		m_buffer_cache.RequestForcedCollection();
+	});
 }
 
 void RenderContext::ShutdownGpu() {
@@ -126,14 +132,14 @@ void RenderContext::PrepareBda() {
 	m_fault_process_pending = true;
 }
 
-void RenderContext::RunGarbageCollector() {
+void RenderContext::RunGarbageCollector(bool force) {
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_texture_cache.ProcessDownloadImages();
-	m_texture_cache.RunGarbageCollector();
-	m_buffer_cache.RunGarbageCollector();
+	m_texture_cache.RunGarbageCollector(force);
+	m_buffer_cache.RunGarbageCollector(force);
 }
 
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {

@@ -77,6 +77,10 @@ void GraphicContext::LogMemoryBudget() const {
 	}
 }
 
+void GraphicContext::SetMemoryPressureHandler(std::function<void()> handler) {
+	m_memory_pressure_handler = std::move(handler);
+}
+
 uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 	if (!CanReportMemoryUsage() || allocator == nullptr) {
 		return 0;
@@ -95,6 +99,17 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 		}
 	}
 	return usage;
+}
+
+uint64_t GraphicContext::GetDeviceLocalHeapSize() const {
+	uint64_t size = 0;
+	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+		const auto& properties = physical_device_memory_properties.memoryHeaps[heap];
+		if (static_cast<bool>(properties.flags & vk::MemoryHeapFlagBits::eDeviceLocal)) {
+			size += properties.size;
+		}
+	}
+	return size;
 }
 
 uint64_t GraphicContext::GetTotalMemoryBudget() const {
@@ -139,6 +154,14 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	auto              result      = static_cast<vk::Result>(
 	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
 	                   &alloc_info, &native_image, &image.allocation, nullptr));
+	bool needed_relief = false;
+	if (result != vk::Result::eSuccess && m_memory_pressure_handler != nullptr) {
+		// Ask the caches to release VRAM. The collection itself must not run here: allocation
+		// callers include scheduler threads, and the collectors wait on scheduled work. The
+		// next render pass runs the forced pass, so only this image may end up off-device.
+		m_memory_pressure_handler();
+		needed_relief = true;
+	}
 	if (result != vk::Result::eSuccess) {
 		// A title whose resident set exceeds the device heap must not fail outright:
 		// retry in whatever memory the driver offers (normally system RAM). Rendering
@@ -152,9 +175,10 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		static size_t fallback_count = 0;
 		if (retry == vk::Result::eSuccess) {
 			if (fallback_count++ < 16) {
-				LOGF("image %ux%u format=%d served from fallback memory (device heap full)\n",
+				LOGF("image %ux%u format=%d served from fallback memory (device heap full%s)\n",
 				     image_info.extent.width, image_info.extent.height,
-				     static_cast<int>(image_info.format));
+				     static_cast<int>(image_info.format),
+				     needed_relief ? ", cache sweep requested" : "");
 			}
 			result = retry;
 		}

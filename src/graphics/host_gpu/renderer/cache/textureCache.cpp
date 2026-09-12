@@ -175,15 +175,19 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
-		constexpr int64_t GiB = 1024ll * 1024 * 1024;
-		const auto        budget =
-		    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-		const auto threshold = std::min<int64_t>(budget, 8 * GiB);
-		m_pressure_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
-		m_critical_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
-		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+		constexpr uint64_t GiB = 1024ull * 1024 * 1024;
+		// Base the target on the size of the device-local heap instead of the free memory the
+		// driver reports: the free number collapses towards zero as the heap fills, which moved
+		// every threshold down exactly when eviction was needed, so the resident set rode the
+		// wall until images had to be served from system memory.
+		constexpr uint64_t desktop_reserve = GiB + GiB / 2;
+		const auto         heap            = m_graphics.GetDeviceLocalHeapSize();
+		if (heap > desktop_reserve + 2 * GiB) {
+			const auto target    = heap - desktop_reserve;
+			m_critical_gc_memory = target - target / 8;
+			m_pressure_gc_memory = target - target / 4;
+			m_trigger_gc_memory  = target - target / 2;
+		}
 	}
 }
 
@@ -1973,8 +1977,13 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	}
 }
 
-void TextureCache::RunGarbageCollector() {
+void TextureCache::RequestForcedCollection() {
+	m_force_collection_requested = true;
+}
+
+void TextureCache::RunGarbageCollector(bool force) {
 	std::scoped_lock lock {m_lock};
+	force = force || m_force_collection_requested.exchange(false);
 	const uint64_t   tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
@@ -1987,18 +1996,21 @@ void TextureCache::RunGarbageCollector() {
 			     m_total_used_memory >> 20, budget >> 20);
 		}
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	if (!force && m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
 	const auto collect = [&](bool allow_aggressive) {
-		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
-		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
+		bool           pressured  = force || m_total_used_memory >= m_pressure_gc_memory;
+		bool           aggressive =
+		    force || (allow_aggressive && m_total_used_memory >= m_critical_gc_memory);
 		// A title that streams more than the device budget cannot be protected by a
 		// wide "recently used" window: keep only what the current frame touches
 		// (streamed textures are re-uploadable from guest memory) and collect more
 		// per pass so the heap stays inside its budget instead of spilling.
-		const uint64_t age       = std::min<uint64_t>(aggressive ? 4 : pressured ? 16 : 64, tick);
-		size_t         deletions = aggressive ? 512 : pressured ? 128 : 32;
+		const uint64_t age =
+		    force ? 0
+		          : std::min<uint64_t>(aggressive ? 4 : pressured ? 16 : 64, tick);
+		size_t deletions = force ? 768 : aggressive ? 512 : pressured ? 128 : 32;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
@@ -2040,8 +2052,8 @@ void TextureCache::RunGarbageCollector() {
 			}
 		}
 	};
-	collect(false);
-	if (m_total_used_memory >= m_critical_gc_memory) {
+		collect(false);
+	if (force || m_total_used_memory >= m_critical_gc_memory) {
 		collect(true);
 	}
 }

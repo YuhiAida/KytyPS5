@@ -580,17 +580,22 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
-void BufferCache::RunGarbageCollector() {
+void BufferCache::RequestForcedCollection() {
+	m_force_collection_requested = true;
+}
+
+void BufferCache::RunGarbageCollector(bool force) {
+	force           = force || m_force_collection_requested.exchange(false);
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	if (!force && m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
 
-	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
+	const bool     aggressive = force || m_total_used_memory >= m_critical_gc_memory;
+	const uint64_t age        = force ? 0 : std::min<uint64_t>(aggressive ? 80 : 160, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 
 	std::vector<BufferId> dirty_buffers;
@@ -605,7 +610,11 @@ void BufferCache::RunGarbageCollector() {
 			return false;
 		}
 		if (dirty) {
-			EXIT_IF(!DownloadBufferMemory(buffer, buffer.CpuAddress(), buffer.Size()));
+			// A failed download must not abort the emulator (forced passes run under memory
+			// pressure): keep the buffer and retry on the next collection.
+			if (!DownloadBufferMemory(buffer, buffer.CpuAddress(), buffer.Size())) {
+				return false;
+			}
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
