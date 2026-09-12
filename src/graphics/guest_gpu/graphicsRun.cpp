@@ -23,7 +23,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -386,8 +388,13 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	}
 	const auto value = Sync::ReadReferenceClock();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
-	LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64 " size=%u\n",
-	     dst_address, value, num_bytes);
+	// Called on every GPU wait (hundreds per second); keep only the first few lines.
+	static std::atomic<uint32_t> clock_log_count {0};
+	if (clock_log_count.fetch_add(1) < 64) {
+		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
+		     " size=%u\n",
+		     dst_address, value, num_bytes);
+	}
 }
 
 void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,
@@ -558,9 +565,63 @@ void GuestGpu::ThreadRun(void* data) {
 	}
 }
 
+static void LogSubmissionTime(double ms);
+
+// Opt-in PM4 profile (KYTY_OPCODE_LOG=1): command volume per second plus the five most
+// expensive packet handlers, so a translation-bound frame can be attributed to opcodes.
+static void RecordOpcodeTime(uint32_t opcode, double ms, uint64_t dwords) {
+	static const bool enabled = std::getenv("KYTY_OPCODE_LOG") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	static double   acc_ms[256] = {};
+	static uint64_t acc_dw[256] = {};
+	static uint64_t window_dw   = 0;
+	static auto     window_start = std::chrono::steady_clock::now();
+	if (opcode < 256) {
+		acc_ms[opcode] += ms;
+		acc_dw[opcode]++;
+	}
+	window_dw += dwords;
+	const auto now = std::chrono::steady_clock::now();
+	const auto elapsed = std::chrono::duration<double>(now - window_start).count();
+	if (elapsed < 1.0) {
+		return;
+	}
+	int best[5] = {-1, -1, -1, -1, -1};
+	for (int i = 0; i < 256; i++) {
+		if (acc_ms[i] <= 0.0) {
+			continue;
+		}
+		for (int slot = 0; slot < 5; slot++) {
+			if (best[slot] < 0 || acc_ms[i] > acc_ms[best[slot]]) {
+				for (int move = 4; move > slot; move--) {
+					best[move] = best[move - 1];
+				}
+				best[slot] = i;
+				break;
+			}
+		}
+	}
+	LOGF("PM4: %.1f MB/s commands:", static_cast<double>(window_dw) * 4.0 / elapsed / 1048576.0);
+	for (int slot = 0; slot < 5; slot++) {
+		if (best[slot] >= 0) {
+			LOGF(" op%02x=%.0fms(%llu)", best[slot], acc_ms[best[slot]],
+			     static_cast<unsigned long long>(acc_dw[best[slot]]));
+		}
+	}
+	LOGF("\n");
+	for (int i = 0; i < 256; i++) {
+		acc_ms[i] = 0.0;
+		acc_dw[i] = 0;
+	}
+	window_dw    = 0;
+	window_start = now;
+}
+
 bool GuestGpu::Process(Submission& submission) {
-	const bool first_slice = !submission.started;
-	auto& cp = GetProcessor(submission.queue_id);
+	const auto process_begin = std::chrono::steady_clock::now();
+	const bool first_slice = !submission.started;	auto& cp = GetProcessor(submission.queue_id);
 
 	if (first_slice && submission.reset_processor) {
 		cp.Reset();
@@ -576,6 +637,16 @@ bool GuestGpu::Process(Submission& submission) {
 	cp.BufferInit();
 	bool complete = true;
 
+	double     process_ms = 0.0;
+	double     gc_ms      = 0.0;
+	double     flush_ms   = 0.0;
+	const auto time_call  = [](double& total, auto&& fn) {
+		const auto t0 = std::chrono::steady_clock::now();
+		fn();
+		total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+		             .count();
+	};
+
 	switch (submission.type) {
 		case SubmissionType::Graphics: {
 			bool progressed = false;
@@ -583,16 +654,20 @@ bool GuestGpu::Process(Submission& submission) {
 			for (;;) {
 				bool round_progress = false;
 				if (!submission.constant_complete) {
-					submission.constant_complete =
-					    cp.Process(submission.constant_execution, submission.constant_commands) ==
-					    Pm4ProcessResult::Complete;
+					time_call(process_ms, [&] {
+						submission.constant_complete =
+						    cp.Process(submission.constant_execution, submission.constant_commands) ==
+						    Pm4ProcessResult::Complete;
+					});
 					round_progress |= submission.constant_execution.MadeProgress();
 				}
 				cp.SetCeComplete(submission.constant_complete);
 				if (!submission.command_complete) {
-					submission.command_complete =
-					    cp.Process(submission.command_execution, submission.commands) ==
-					    Pm4ProcessResult::Complete;
+					time_call(process_ms, [&] {
+						submission.command_complete =
+						    cp.Process(submission.command_execution, submission.commands) ==
+						    Pm4ProcessResult::Complete;
+					});
 					round_progress |= submission.command_execution.MadeProgress();
 				}
 				progressed |= round_progress;
@@ -603,11 +678,11 @@ bool GuestGpu::Process(Submission& submission) {
 			}
 			if (progressed) {
 				if (complete) {
-					m_renderer.RunGarbageCollector();
+					time_call(gc_ms, [&] { m_renderer.RunGarbageCollector(); });
 				}
-				cp.BufferFlush();
+				time_call(flush_ms, [&] { cp.BufferFlush(); });
 			} else if (complete) {
-				m_renderer.RunGarbageCollector();
+				time_call(gc_ms, [&] { m_renderer.RunGarbageCollector(); });
 			}
 			break;
 		}
@@ -625,25 +700,62 @@ bool GuestGpu::Process(Submission& submission) {
 			if (first_slice) {
 				GraphicsDbgDumpDcb("cc", num_dw, buffer);
 			}
-			complete = cp.Process(submission.command_execution, submission.commands) ==
-			           Pm4ProcessResult::Complete;
+			time_call(process_ms, [&] {
+				complete = cp.Process(submission.command_execution, submission.commands) ==
+				           Pm4ProcessResult::Complete;
+			});
 			if (submission.command_execution.MadeProgress()) {
 				if (complete) {
-					m_renderer.RunGarbageCollector();
+					time_call(gc_ms, [&] { m_renderer.RunGarbageCollector(); });
 				}
-				cp.BufferFlush();
+				time_call(flush_ms, [&] { cp.BufferFlush(); });
 			} else if (complete) {
-				m_renderer.RunGarbageCollector();
+				time_call(gc_ms, [&] { m_renderer.RunGarbageCollector(); });
 			}
 			break;
 		}
 		case SubmissionType::FlipPreparation:
-			m_renderer.RunGarbageCollector();
-			cp.PrepareCpuFlip(submission.flip_request_id);
+			time_call(gc_ms, [&] { m_renderer.RunGarbageCollector(); });
+			time_call(flush_ms, [&] { cp.PrepareCpuFlip(submission.flip_request_id); });
 			break;
 	}
 
+	const auto total_ms =
+	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - process_begin)
+	        .count();
+	LogSubmissionTime(total_ms);
+	if (total_ms >= 100.0) {
+		LOGF("Sub: slow %.0f ms (translate=%.0f gc=%.0f flush=%.0f)\n", total_ms, process_ms, gc_ms,
+		     flush_ms);
+	}
 	return complete;
+}
+
+// Opt-in guest GPU submission profile (KYTY_SUB_LOG=1): submissions per second and the wall
+// time they occupy. Distinguishes "frames cost CPU in the command processor" from "frames
+// wait for something else".
+static void LogSubmissionTime(double ms) {
+	static const bool enabled = std::getenv("KYTY_SUB_LOG") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	static auto     window_start = std::chrono::steady_clock::now();
+	static uint64_t count       = 0;
+	static double   total_ms    = 0.0;
+	static double   max_ms      = 0.0;
+	count++;
+	total_ms = total_ms + ms;
+	max_ms   = std::max(max_ms, ms);
+	const auto now     = std::chrono::steady_clock::now();
+	const auto elapsed = std::chrono::duration<double>(now - window_start).count();
+	if (elapsed >= 1.0) {
+		LOGF("Sub: count=%llu work=%.0f ms/s max=%.0f ms\n",
+		     static_cast<unsigned long long>(count), total_ms, max_ms);
+		window_start = now;
+		count        = 0;
+		total_ms     = 0.0;
+		max_ms       = 0.0;
+	}
 }
 
 Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
@@ -779,8 +891,14 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+		const auto packet_begin = std::chrono::steady_clock::now();
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		RecordOpcodeTime(
+		    opcode,
+		    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - packet_begin)
+		        .count(),
+		    packet_dw);
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			if (execution.m_buffer_stack.size() > buffer_index + 1) {
