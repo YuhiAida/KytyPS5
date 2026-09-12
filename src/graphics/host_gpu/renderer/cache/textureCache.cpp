@@ -1979,6 +1979,14 @@ void TextureCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
+	// Report device-heap pressure so cache eviction is visible in the log.
+	if (m_graphics.CanReportMemoryUsage() && (tick & 0x3ffu) == 0u) {
+		const auto budget = m_graphics.GetTotalMemoryBudget();
+		if (budget != 0 && m_total_used_memory * 10u > budget * 7u) {
+			LOGF("TextureCache: device heap %" PRIu64 " MiB of %" PRIu64 " MiB\n",
+			     m_total_used_memory >> 20, budget >> 20);
+		}
+	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
