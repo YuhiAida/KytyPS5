@@ -23,7 +23,13 @@
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+
+#ifdef __linux__
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -60,15 +66,38 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
 	}
 }
 
-std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
+// Identifies the running emulator binary (size + mtime). Only used when the cache is force
+// enabled: a rebuild then changes the signature automatically, so driver binaries compiled by
+// older local code can never be reused.
+std::string BinaryCacheStamp() {
+#ifdef __linux__
+	char       path[4096] = {};
+	const auto len        = ::readlink("/proc/self/exe", path, sizeof(path) - 1);
+	if (len <= 0) {
+		return {};
+	}
+	struct stat st {};
+	if (::stat(path, &st) != 0) {
+		return {};
+	}
+	return fmt::format("bin={}:{}", static_cast<uint64_t>(st.st_size),
+	                   static_cast<uint64_t>(st.st_mtime));
+#else
+	return {};
+#endif
+}
+
+std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties,
+                                 std::string_view                  suffix = {}) {
 	constexpr char hex[] = "0123456789abcdef";
 	std::string    uuid(VK_UUID_SIZE * 2, '0');
 	for (size_t i = 0; i < VK_UUID_SIZE; i++) {
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
-	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
+	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}{}\n", KYTY_GIT_REVISION,
+	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid,
+	                   suffix);
 }
 
 std::string PipelineCacheTitleId() {
@@ -420,7 +449,12 @@ void PipelineCache::InitializeDriverCache() {
 	if (title_id.empty()) {
 		return;
 	}
-	if (KYTY_BUILD != KYTY_BUILD_RELEASE) {
+	// Local/dev builds are disabled by default: their code can change without the revision
+	// changing, which would silently reuse driver binaries compiled from old code.
+	// KYTY_PIPELINE_CACHE=1 opts in; the signature then also contains the emulator binary
+	// stamp, so every rebuild invalidates the cache automatically.
+	const bool cache_forced = std::getenv("KYTY_PIPELINE_CACHE") != nullptr;
+	if (KYTY_BUILD != KYTY_BUILD_RELEASE && !cache_forced) {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
 		return;
 	}
@@ -430,9 +464,18 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
 		return;
 	}
-	if (git_hash.ends_with("-dirty")) {
+	if (git_hash.ends_with("-dirty") && !cache_forced) {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
 		return;
+	}
+	if (cache_forced) {
+		const auto stamp = BinaryCacheStamp();
+		if (!stamp.empty()) {
+			m_signature_suffix = ":" + stamp;
+		}
+		PipelineCacheLog("Vulkan pipeline cache: enabled by KYTY_PIPELINE_CACHE (build={}, "
+		                 "stamp={})",
+		                 git_hash, stamp.empty() ? "none" : stamp);
 	}
 
 	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
@@ -447,7 +490,8 @@ void PipelineCache::InitializeDriverCache() {
 	if (cache_exists) {
 		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
 		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
-		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+		const auto   signature =
+		    DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties(), m_signature_suffix);
 		if (file_size >= signature.size() + sizeof(uint64_t) &&
 		    file_size <= std::numeric_limits<uint32_t>::max()) {
 			std::string cached_signature(signature.size(), '\0');
@@ -503,6 +547,24 @@ void PipelineCache::InitializeDriverCache() {
 
 void PipelineCache::Save() {
 	Common::LockGuard lock(m_mutex);
+	SaveInternal(true);
+}
+
+void PipelineCache::MaybeSaveInternal() {
+	if (m_driver_cache == nullptr || m_unsaved_pipelines < 64) {
+		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (m_last_save != std::chrono::steady_clock::time_point {} &&
+	    now - m_last_save < std::chrono::seconds(120)) {
+		return;
+	}
+	m_unsaved_pipelines = 0;
+	m_last_save         = now;
+	SaveInternal(false);
+}
+
+void PipelineCache::SaveInternal(bool destroy) {
 	if (m_driver_cache == nullptr) {
 		return;
 	}
@@ -530,7 +592,8 @@ void PipelineCache::Save() {
 		return;
 	}
 	payload.resize(size);
-	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+	auto       prefix =
+	    DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties(), m_signature_suffix);
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
@@ -556,8 +619,10 @@ void PipelineCache::Save() {
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
+	if (destroy) {
+		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+		m_driver_cache = nullptr;
+	}
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
@@ -790,6 +855,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
+	m_unsaved_pipelines++;
+	MaybeSaveInternal();
 
 	return *iter->second;
 }
@@ -820,6 +887,8 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
+	m_unsaved_pipelines++;
+	MaybeSaveInternal();
 
 	return *iter->second;
 }

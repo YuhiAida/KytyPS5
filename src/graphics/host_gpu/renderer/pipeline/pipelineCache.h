@@ -9,10 +9,12 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
 
@@ -214,8 +216,14 @@ private:
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	Common::Mutex m_mutex;
+	uint32_t      m_unsaved_pipelines = 0;
+	std::chrono::steady_clock::time_point m_last_save {};
+	std::string                           m_signature_suffix;
 
 	void InitializeDriverCache();
+	void SaveInternal(bool destroy);
+	// Throttled mid-run save (called with m_mutex held).
+	void MaybeSaveInternal();
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
