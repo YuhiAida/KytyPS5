@@ -1154,7 +1154,14 @@ bool FlipQueue::Flip(uint32_t micros) {
 	m_requests.front().state = RequestState::Presenting;
 	m_mutex.Unlock();
 
+	const auto present_start = std::chrono::steady_clock::now();
 	m_presenter.Present(*r.frame);
+	const auto present_ms =
+	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - present_start)
+	        .count();
+	if (present_ms >= 50.0) {
+		LOGF("Present: flip image took %.0f ms\n", present_ms);
+	}
 
 	m_mutex.Lock();
 	if (m_requests.empty() || m_requests.front().id != r.id ||
