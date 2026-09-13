@@ -562,3 +562,60 @@ Phase attribution if needed first: `LogDrawPhase` (debug.cpp:618, gated by
   the sibling modules, then compare `spirv-dis | grep -o Op[A-Za-z]* | sort | uniq -c`
   histograms against the monster dump to name the pathological construct.
 
+## Iteration 35 - GPU timestamp attribution instrument (KYTY_GPU_TIME_LOG)
+- `CommandScheduler` records BOTTOM_OF_PIPE timestamps: batch start/end (BeginCommand/Submit)
+  and a 3-point bracket per compute dispatch (renderCompute.cpp emission). Readback drains in
+  `PopPendingOperations` once the submission tick is free; 1 Hz `GpuTime:`/`GpuTimeTop:` lines.
+- Pitfall found: TOP_OF_PIPE/BOTTOM_OF_PIPE mixing lets consecutive brackets overlap (sum > wall
+  time); BOTTOM_OF_PIPE for both ends keeps the sum serialized (log cadence can still cover >1 s).
+
+## Iteration 36 - the fps gate is ONE shader in dispatcher mode
+- Slow phase: `GpuTimeTop` dominated by CS 0x1929ac47f3eaefa0 (`groups=30x17x16`, mode=0x41) with
+  ~600-900 ms brackets per frame; every other dispatch <= 2.5 ms (300x gap). GPU busy ~= span
+  (96-97 %), gap 65-100 ms/s => execution-bound on this shader, not serialization.
+- Same shader is the 41.5 s driver compile: dispatcher fallback -> 1712 Function vars + 87-case
+  switch -> pathological for both driver and hardware.
+
+## Iteration 37 - root cause + fix: cross-entry tail duplication
+- Captured CFG (`KYTY_CFG_DUMP=1`, `_Build/linux/_Shaders/0000_shader_cs_1929ac47f3eaefa0.cfg.txt`):
+  selection 7 (7: execz -> 85/8) has region 8..84; block 14 is entered from 3 (outside) and from 13
+  (inside); loops 16..79 / 43..78 sit inside the cloned tail.
+- Implemented bounded cross-entry duplication in `ShaderCFG.cpp`
+  (`DuplicateOneExternalSelectionRegion`, recovered from the parked cb6ead5 commit): clone region
+  members the header does not dominate, redirect header-owned edges into clones, join header-owned
+  exits through a private synthetic merge; applied one region per attempt AFTER selection routing in
+  `Structurize`; loop-closure guard (back edges wholly inside or outside the clone set);
+  post-transform dominance verification; budget 8x (32..1024).
+- Tests: `shader_cfg_tests` and `shader_recompiler_compute_tests` pass. Also fixed stale test
+  expectations (download utility 32 -> 128 MiB, from e6eff87).
+
+## Iteration 38 - verified: freeze gone, fps 1.4 -> 30
+- `CFG dispatcher fallback` = 0 (was 1/run, always this hash); `PipeCreate: driver create` = 0
+  (no create >= 50 ms anywhere); monster absent from GpuTimeTop (top now <= 2.5 ms).
+- fps: 1.1-1.5 -> 3.5/4.5/5.3 then 30.0 sustained windows (16 samples at 30.0) in a 180 s run.
+
+## Iteration 39 - NEW crash after the fix (backtrace captured)
+- Run B0 (180 s, dumps on) ends with `Unhandled host exception ... access=1 address=0x0`;
+  gdb capture (script `_Build/gdb_crash2.gdb`, guest SIGSEGV passed through) gives the stack:
+  `std::fill` <- `BufferCache::FillBuffer` <- `CommandProcessor::DmaData` <- `CpOpDmaData` <- PM4.
+- FillBuffer's fast path writes the guest VA directly (`std::fill((uint32_t*)vaddr, ...)`,
+  bufferCache.cpp ~552); the page is unmapped, and `RenderContext::HandleFault` declines because
+  the range is not in `m_mapped_ranges` (registered by `MapGpuRange` from the kernel memory APIs).
+- Facts: fill target 0x3080650000 (guest), first observed at flip ~632, reproducible under gdb;
+  everything before it runs at 30 fps.
+- Next instruments: log MapGpuRange/UnmapGpuRange (addr+size+API, capped) and the HandleFault
+  rejection detail; rerun to see whether the range was never registered or was unmapped (VRAM
+  reclaim commits a046563/0c1ca79 are the suspects to rule out).
+- Note: the completion-tracked GC release (8a154ac) is currently REVERTED (80696e6, no journal
+  rationale); GC stalls are back in `Sub: slow` (0.7-1.3 s) - re-evaluate after the crash.
+
+## Handoff seed (2026-09-13 late session)
+- Landed on `fix/spongebob-playability` (single branch off the exp tip): GPU-time instrument,
+  gated CFG dump, pipe layout log, structurizer duplication fix, test expectation fix.
+- Remaining blocker: the 0x3080650000 DMA-fill crash (Iteration 39). Repro: `TIMEOUT=180
+  PRINTF_DIRECTION=File PRINTF_FILE=B.txt KYTY_PIPELINE_CACHE=1 KYTY_FPS_LOG=1 ./tools/run-sponge.sh`
+  -> crashes ~60-120 s in. gdb: `gdb -batch -x _Build/gdb_crash2.gdb --args ./kyty_emulator <args>`
+  (passes guest SIGILL/SIGSEGV, stops on host faults).
+- Frozen evidence: `_Build/linux/B0_struct.txt` (pre-crash), 
+  `_Build/linux/_Shaders/0000_shader_cs_1929ac47f3eaefa0.cfg.txt`, `/tmp/gdb_out6.txt` (backtrace).
+
