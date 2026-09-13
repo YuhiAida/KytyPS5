@@ -311,27 +311,55 @@ namespace {
 // the host image with plain buffer/image copies (guest extents), which cannot rescale, and a
 // scaled backing would make those copies exceed the host extent (GPU hang). The presenter blits
 // the guest-sized video-out surface into the swapchain, which already downscales it.
+// Guest addresses that must keep their native host extent in every binding, even when their
+// binding type would scale. Video-out flip buffers are aliased across binding types and move
+// their content through guest-extent copies: scaling them yields cropped presentation and
+// stalls the guest render thread. Experimental list: KYTY_RENDER_SCALE_SKIP=0x...,0x...
+static bool IsRenderScaleSkippedAddress(uint64_t address) {
+	static const std::vector<uint64_t> skipped = [] {
+		std::vector<uint64_t> list;
+		const char*           env = std::getenv("KYTY_RENDER_SCALE_SKIP");
+		for (const char* p = env; p != nullptr && *p != '\0';) {
+			char*      end   = nullptr;
+			const auto value = std::strtoull(p, &end, 0);
+			if (end == p) {
+				break;
+			}
+			list.push_back(value);
+			p = (*end == ',') ? end + 1 : end;
+		}
+		return list;
+	}();
+	return std::find(skipped.begin(), skipped.end(), address) != skipped.end();
+}
+
 float WantedRenderScale(TextureCache::BindingType type, const ImageInfo& info) {
+	if (IsRenderScaleSkippedAddress(info.data.address)) {
+		return 1.0f;
+	}
 	// Diagnostic escape hatch: scale every binding (textures included) to measure how much of
 	// the frame is texture bandwidth vs render-target work. Not a correctness path.
 	// KYTY_RENDER_SCALE_CATS narrows that to a comma-separated subset of the categories
-	// "rt" (render/depth targets, the default), "tex" (sampled textures + storage images)
-	// and "vo" (video-out surfaces); ALL=1 means "rt,tex,vo".
+	// "rt" (render/depth targets, the default), "tex" (sampled textures), "sto" (storage
+	// images, whose compute dispatch dimensions are not scaled by extent alone) and "vo"
+	// (video-out surfaces); ALL=1 means all of them.
 	const bool all = std::getenv("KYTY_RENDER_SCALE_ALL") != nullptr;
 	bool       rt  = !all;
 	bool       tex = all;
+	bool       sto = all;
 	bool       vo  = all;
 	if (const char* cats = std::getenv("KYTY_RENDER_SCALE_CATS")) {
 		rt  = std::strstr(cats, "rt") != nullptr;
 		tex = std::strstr(cats, "tex") != nullptr;
+		sto = std::strstr(cats, "sto") != nullptr;
 		vo  = std::strstr(cats, "vo") != nullptr;
 	}
 	bool wanted = false;
 	switch (type) {
 		case TextureCache::BindingType::RenderTarget:
 		case TextureCache::BindingType::DepthTarget: wanted = rt; break;
-		case TextureCache::BindingType::Texture:
-		case TextureCache::BindingType::Storage: wanted = tex; break;
+		case TextureCache::BindingType::Texture: wanted = tex; break;
+		case TextureCache::BindingType::Storage: wanted = sto; break;
 		case TextureCache::BindingType::VideoOut: wanted = vo; break;
 	}
 	if (!wanted) {
