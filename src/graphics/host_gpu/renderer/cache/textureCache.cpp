@@ -395,7 +395,8 @@ static bool IsRenderScaleSkippedAddress(uint64_t address) {
 	return std::find(skipped.begin(), skipped.end(), address) != skipped.end();
 }
 
-float WantedRenderScale(TextureCache::BindingType type, const ImageInfo& info) {
+float WantedRenderScale(GraphicContext& graphics, TextureCache::BindingType type,
+                        const ImageInfo& info) {
 	if (IsRenderScaleSkippedAddress(info.data.address)) {
 		return 1.0f;
 	}
@@ -416,6 +417,9 @@ float WantedRenderScale(TextureCache::BindingType type, const ImageInfo& info) {
 		sto = std::strstr(cats, "sto") != nullptr;
 		vo  = std::strstr(cats, "vo") != nullptr;
 	}
+	// Video-out surfaces stay native: their copies (presenter frame copy, snapshot) do not
+	// resample yet, so scaling them would hand mismatched extents to the presentation path.
+	vo = false;
 	bool wanted = false;
 	switch (type) {
 		case TextureCache::BindingType::RenderTarget:
@@ -425,6 +429,18 @@ float WantedRenderScale(TextureCache::BindingType type, const ImageInfo& info) {
 		case TextureCache::BindingType::VideoOut: wanted = vo; break;
 	}
 	if (!wanted) {
+		return 1.0f;
+	}
+	// Resampled transfers need a blittable single-sample colour format; compressed, depth and
+	// multisampled surfaces keep their native size until their transfers are proven correct.
+	if (info.IsBlock() || info.IsDepth() || info.samples != 1u ||
+	    info.pixel_format == vk::Format::eUndefined) {
+		return 1.0f;
+	}
+	const auto blit_features =
+	    graphics.GetFormatProperties(info.pixel_format).optimalTilingFeatures;
+	if (!static_cast<bool>(blit_features & (vk::FormatFeatureFlagBits::eBlitSrc |
+	                                        vk::FormatFeatureFlagBits::eBlitDst))) {
 		return 1.0f;
 	}
 	if (info.extent.width == 0 || info.extent.height == 0) {
@@ -1503,7 +1519,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		if (!result) {
-			const float scale = WantedRenderScale(desc.type, desc.info);
+			const float scale = WantedRenderScale(m_graphics, desc.type, desc.info);
 			result            = InsertImage(desc.info, scale, scale);
 			auto& inserted    = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
@@ -1514,7 +1530,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		auto& image = m_slot_images[result];
 		if (image.host_scale_x == 1.0f) {
 			// A surface first materialised through a non-scalable binding keeps its native size.
-			const float wanted_scale = WantedRenderScale(desc.type, desc.info);
+			const float wanted_scale = WantedRenderScale(m_graphics, desc.type, desc.info);
 			static std::atomic<uint32_t> log_count {0};
 			if (wanted_scale < 1.0f && std::getenv("KYTY_RENDER_SCALE_LOG") != nullptr &&
 			    log_count.fetch_add(1, std::memory_order_relaxed) < 32) {

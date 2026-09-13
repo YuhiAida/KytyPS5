@@ -661,3 +661,17 @@ Phase attribution if needed first: `LogDrawPhase` (debug.cpp:618, gated by
   27-57 fps before the guest crashes on stale values: the guest's reads of GPU-written memory
   are forcing full GPU drains (serialisation). Next lever: make GPU writes CPU-visible without
   a drain (eager write-back / GPU-side indirection), not more raster scaling.
+
+## Iteration 44 - render-scale attempt (reverted) and what it proved
+- Implemented guest-extent staging + blit resampling for Image::Upload/Download (with
+  Image::Transit barriers and a deferred staging delete) plus WantedRenderScale guards.
+- Result: with `KYTY_RENDER_SCALE=0.5` the GPU timeline hangs on the first 4K -> 1080p
+  resample upload (`MasterSemaphore waiting tick=952 current=951 who=finish`; one present
+  dump at 0 ms, then nothing). Ruled out: barrier stage masks, blit filter mode, staging
+  lifetime (leaking it still hangs). With resampling disabled the same experiment presents
+  fine (dumps=20).
+- Prize measured while it was gated off: scale=0.5 with the old clamped path dropped GPU
+  utilisation from ~70-77 % to ~22-24 % - the scaling lever is real, the transfer plumbing
+  is what is missing. Retry with Vulkan validation enabled before re-landing.
+- Kept from the attempt: WantedRenderScale now requires a blittable single-sample colour
+  format and keeps depth, compressed, multisampled and video-out surfaces native (v2 policy).
