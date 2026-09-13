@@ -314,9 +314,27 @@ namespace {
 float WantedRenderScale(TextureCache::BindingType type, const ImageInfo& info) {
 	// Diagnostic escape hatch: scale every binding (textures included) to measure how much of
 	// the frame is texture bandwidth vs render-target work. Not a correctness path.
-	const bool scale_all = std::getenv("KYTY_RENDER_SCALE_ALL") != nullptr;
-	if (!scale_all && type != TextureCache::BindingType::RenderTarget &&
-	    type != TextureCache::BindingType::DepthTarget) {
+	// KYTY_RENDER_SCALE_CATS narrows that to a comma-separated subset of the categories
+	// "rt" (render/depth targets, the default), "tex" (sampled textures + storage images)
+	// and "vo" (video-out surfaces); ALL=1 means "rt,tex,vo".
+	const bool all = std::getenv("KYTY_RENDER_SCALE_ALL") != nullptr;
+	bool       rt  = !all;
+	bool       tex = all;
+	bool       vo  = all;
+	if (const char* cats = std::getenv("KYTY_RENDER_SCALE_CATS")) {
+		rt  = std::strstr(cats, "rt") != nullptr;
+		tex = std::strstr(cats, "tex") != nullptr;
+		vo  = std::strstr(cats, "vo") != nullptr;
+	}
+	bool wanted = false;
+	switch (type) {
+		case TextureCache::BindingType::RenderTarget:
+		case TextureCache::BindingType::DepthTarget: wanted = rt; break;
+		case TextureCache::BindingType::Texture:
+		case TextureCache::BindingType::Storage: wanted = tex; break;
+		case TextureCache::BindingType::VideoOut: wanted = vo; break;
+	}
+	if (!wanted) {
 		return 1.0f;
 	}
 	if (info.extent.width == 0 || info.extent.height == 0) {
