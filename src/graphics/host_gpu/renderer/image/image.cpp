@@ -1045,6 +1045,18 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     create.extent.width, create.extent.height, create.extent.depth,
 		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
 	}
+	if (std::getenv("KYTY_STORAGE_LOG") != nullptr) {
+		static std::atomic<uint32_t> create_log {0};
+		if (create_log.fetch_add(1, std::memory_order_relaxed) < 4096) {
+			LOGF("Image: create 0x%llx addr=0x%016" PRIx64 " fmt=%u usage=0x%x extent=%ux%u "
+			     "samples=%u levels=%u\n",
+			     static_cast<unsigned long long>(
+			         reinterpret_cast<uint64_t>(static_cast<VkImage>(backing.image))),
+			     info.data.address, static_cast<uint32_t>(create.format),
+			     static_cast<uint32_t>(create.usage), create.extent.width, create.extent.height,
+			     info.samples, info.resources.levels);
+		}
+	}
 }
 
 uint64_t Image::HashGuestEdges() const {

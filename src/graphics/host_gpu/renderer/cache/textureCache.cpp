@@ -1632,6 +1632,21 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 				CommitGpuWrite(image);
 			}
 			TrackImageDownload(id, image);
+			if (!static_cast<bool>(image.backing.usage & vk::ImageUsageFlagBits::eStorage)) {
+				static std::atomic<uint32_t> log_count {0};
+				if (std::getenv("KYTY_STORAGE_LOG") != nullptr &&
+				    log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+					LOGF("Storage: bound without storage usage addr=0x%016" PRIx64
+					     " image_format=%u view_format=%u block=%d samples=%u extent=%ux%u "
+					     "usage=0x%x image=0x%llx\n",
+					     image.info.data.address, static_cast<uint32_t>(image.backing.format),
+					     static_cast<uint32_t>(desc.view_info.format), image.info.IsBlock() ? 1 : 0,
+					     image.info.samples, image.info.extent.width, image.info.extent.height,
+					     static_cast<uint32_t>(image.backing.usage),
+					     static_cast<unsigned long long>(
+					         reinterpret_cast<uint64_t>(static_cast<VkImage>(image.backing.image))));
+				}
+			}
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
