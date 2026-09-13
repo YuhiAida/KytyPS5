@@ -29,6 +29,7 @@
 #include <mutex>
 #include <span>
 #include <tuple>
+#include <unordered_map>
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
@@ -179,9 +180,20 @@ static std::atomic<uint64_t> g_upload_bytes {0};
 static std::atomic<uint64_t> g_download_calls {0};
 static std::atomic<uint64_t> g_download_bytes {0};
 
-void Upload(uint64_t bytes) {
+struct UploadAddressCounter {
+	uint64_t bytes = 0;
+	uint64_t calls = 0;
+};
+static std::mutex                                         g_upload_mutex;
+static std::unordered_map<uint64_t, UploadAddressCounter> g_upload_by_address;
+
+void Upload(uint64_t address, uint64_t bytes) {
 	g_upload_calls.fetch_add(1);
 	g_upload_bytes.fetch_add(bytes);
+	std::scoped_lock lock {g_upload_mutex};
+	auto&            counter = g_upload_by_address[address];
+	counter.bytes += bytes;
+	counter.calls++;
 }
 
 void Download(uint64_t bytes) {
@@ -209,6 +221,22 @@ void ReportIfEnabled() {
 	     static_cast<unsigned long long>(upload_calls),
 	     static_cast<double>(download_bytes) / elapsed / 1048576.0,
 	     static_cast<unsigned long long>(download_calls));
+	{
+		std::scoped_lock lock {g_upload_mutex};
+		std::vector<std::pair<uint64_t, UploadAddressCounter>> top {g_upload_by_address.begin(),
+		                                                            g_upload_by_address.end()};
+		g_upload_by_address.clear();
+		std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) {
+			return a.second.bytes > b.second.bytes;
+		});
+		for (size_t i = 0; i < top.size() && i < 5; i++) {
+			LOGF("Xfer:   addr=0x%016" PRIx64 " %.1f MB/s (%llu calls, avg %.1f KiB)\n",
+			     top[i].first, static_cast<double>(top[i].second.bytes) / elapsed / 1048576.0,
+			     static_cast<unsigned long long>(top[i].second.calls),
+			     static_cast<double>(top[i].second.bytes) /
+			         static_cast<double>(std::max<uint64_t>(top[i].second.calls, 1)) / 1024.0);
+		}
+	}
 	last = now;
 }
 } // namespace ExternalTransferCounters
@@ -1181,7 +1209,7 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
 	const auto& info    = image.info;
-	ExternalTransferCounters::Upload(info.data.size);
+	ExternalTransferCounters::Upload(info.data.address, info.data.size);
 	const auto  binding = UploadBinding(image);
 	const auto  upload  = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
 		for (auto& copy: copies) {
