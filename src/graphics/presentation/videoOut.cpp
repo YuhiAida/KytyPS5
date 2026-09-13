@@ -354,6 +354,38 @@ static void RemoveVideoOutEventQueue(EventQueue::KernelEqueue       eq,
 	}
 }
 
+// Opt-in present/trigger diagnostic (KYTY_PRESENT_LOG=1): counts video-out event deliveries and
+// stale (generation-skipped) registrations once per second. Distinguishes "tick loop stopped"
+// from "ticks continue but events are not delivered".
+static void PresentDiagTrigger(VideoOutEventKind kind, bool stale) {
+	static const bool enabled = std::getenv("KYTY_PRESENT_LOG") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	static std::atomic<uint64_t> vblank {0}, pre {0}, flip {0}, mode {0}, skipped {0};
+	if (stale) {
+		skipped.fetch_add(1);
+	} else {
+		switch (kind) {
+			case VideoOutEventKind::Vblank: vblank.fetch_add(1); break;
+			case VideoOutEventKind::PreVblankStart: pre.fetch_add(1); break;
+			case VideoOutEventKind::Flip: flip.fetch_add(1); break;
+			case VideoOutEventKind::OutputMode: mode.fetch_add(1); break;
+		}
+	}
+	static auto last = std::chrono::steady_clock::now();
+	const auto  now  = std::chrono::steady_clock::now();
+	if (now - last >= std::chrono::seconds(1)) {
+		LOGF("Vtrig: vblank=%llu pre=%llu flip=%llu mode=%llu stale_skip=%llu\n",
+		     static_cast<unsigned long long>(vblank.exchange(0)),
+		     static_cast<unsigned long long>(pre.exchange(0)),
+		     static_cast<unsigned long long>(flip.exchange(0)),
+		     static_cast<unsigned long long>(mode.exchange(0)),
+		     static_cast<unsigned long long>(skipped.exchange(0)));
+		last = now;
+	}
+}
+
 static void TriggerVideoOutEvents(VideoOutConfig& video_out, VideoOutEventKind kind,
                                   void* trigger_data) {
 	VideoOutEventQueues queues;
@@ -363,11 +395,15 @@ static void TriggerVideoOutEvents(VideoOutConfig& video_out, VideoOutEventKind k
 	}
 	for (const auto& registration: queues) {
 		if (!registration || registration->generation != video_out.generation) {
+			PresentDiagTrigger(kind, true);
 			continue;
 		}
 		const auto result =
 		    EventQueue::KernelTriggerEvent(registration->handle, VideoOutEventId(kind),
 		                                   EventQueue::KERNEL_EVFILT_VIDEO_OUT, trigger_data);
+		if (result == OK) {
+			PresentDiagTrigger(kind, false);
+		}
 		EXIT_NOT_IMPLEMENTED(result != OK && result != LibKernel::KERNEL_ERROR_EBADF &&
 		                     result != LibKernel::KERNEL_ERROR_ENOENT);
 	}
@@ -804,6 +840,34 @@ static void RecordPresentedFrame() {
 	}
 }
 
+// Opt-in present-thread tick profile (KYTY_PRESENT_LOG=1): once per second, how many loop
+// iterations completed, how many were guest-paused and how many presented a flip. If the lines
+// stop during a freeze, the thread is blocked inside a call. All values reset each second.
+static void LogPresentTick(bool guest_paused, bool presented) {
+	static const bool enabled = std::getenv("KYTY_PRESENT_LOG") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	static auto     last   = std::chrono::steady_clock::now();
+	static uint64_t ticks  = 0;
+	static uint64_t pauses = 0;
+	static uint64_t flips  = 0;
+	ticks++;
+	pauses += guest_paused ? 1 : 0;
+	flips += presented ? 1 : 0;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - last >= std::chrono::seconds(1)) {
+		LOGF("Ptick: ticks=%llu paused=%llu flips=%llu gap_ms=%.1f\n",
+		     static_cast<unsigned long long>(ticks), static_cast<unsigned long long>(pauses),
+		     static_cast<unsigned long long>(flips),
+		     std::chrono::duration<double, std::milli>(now - last).count());
+		last   = now;
+		ticks  = 0;
+		pauses = 0;
+		flips  = 0;
+	}
+}
+
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
@@ -830,6 +894,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
 				m_presenter.Present(*frame, true);
 			}
+			LogPresentTick(true, false);
 			const auto frame_end = Common::Timer::QueryPerformanceCounter();
 			total_wait +=
 			    static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
@@ -876,6 +941,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 			}
 		}
 		VblankEnd();
+		LogPresentTick(false, presented);
 
 		const auto frame_end = Common::Timer::QueryPerformanceCounter();
 		total_wait += static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);

@@ -1367,6 +1367,38 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		}
 	}
 
+	// KYTY_SKIP_COMPUTE=1 (diagnostic only): drop compute dispatches entirely to measure
+	// their share of frame time. Rendered output is meaningless; fps is the signal.
+	if (std::getenv("KYTY_SKIP_COMPUTE") != nullptr) {
+		static std::atomic<uint64_t> skipped {0};
+		static auto                  last = std::chrono::steady_clock::now();
+		skipped.fetch_add(1);
+		const auto now = std::chrono::steady_clock::now();
+		if (now - last >= std::chrono::seconds(1)) {
+			LOGF("SkipCompute: %llu/s\n", static_cast<unsigned long long>(skipped.exchange(0)));
+			last = now;
+		}
+		return;
+	}
+
+	// KYTY_COMPUTE_TINY=1 (diagnostic only): keep the full translation path but run every
+	// dispatch with a 1x1x1 grid - separates per-dispatch fixed cost from thread-work cost.
+	if (std::getenv("KYTY_COMPUTE_TINY") != nullptr) {
+		static std::atomic<uint64_t> converted {0};
+		static auto                  last = std::chrono::steady_clock::now();
+		thread_group_x     = 1;
+		thread_group_y     = 1;
+		thread_group_z     = 1;
+		indirect_args_addr = 0;
+		converted.fetch_add(1);
+		const auto now = std::chrono::steady_clock::now();
+		if (now - last >= std::chrono::seconds(1)) {
+			LOGF("TinyCompute: %llu/s\n",
+			     static_cast<unsigned long long>(converted.exchange(0)));
+			last = now;
+		}
+	}
+
 	uint32_t frame_num = 0;
 	// uint32_t local_x   = 1;
 	// uint32_t local_y   = 1;
