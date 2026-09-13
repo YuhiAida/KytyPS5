@@ -354,3 +354,49 @@ Phase attribution if needed first: `LogDrawPhase` (debug.cpp:618, gated by
   before production).
 - Journal: memory/2026-09-13-spongebob-playability.md
 
+## Iteration 19 - readback ablation (negative)
+- KYTY_SKIP_READBACK: still collapses to 1.9-3.6 fps. Readback waits are a symptom of a busy
+  GPU, not the cause.
+
+## Iteration 20 - compute ablation (positive)
+- KYTY_SKIP_COMPUTE=1: slow phase 4 -> ~10 fps. Skip rate showed the game pushes ~3700
+  dispatches/s; baseline only gets ~700/s through (backpressure). => compute execution ~60% of
+  frame time; effective ~0.9 ms per (small) dispatch.
+- KYTY_COMPUTE_TINY=1 (1x1x1 grids): confounded (game derails on wrong values: 0.4-2 fps), but
+  dispatch throughput still capped ~700/s => the cap is not proportional to grid size.
+
+## Iteration 21 - freeze forensics
+- Freeze reproduced in harness runs: chk2 (presents stop at 33 s, shader compiles continue to
+  75 s end), chk3 (48 s present gap, 0.4 fps, frame at 92.9 s still = autosave notice screen).
+- Guest face of it: thread 49 waits EVFILT_VIDEO_OUT vblank events (ident=1) and RECEIVES them
+  at ~60-70/s through the whole frozen run (5295 waits, sole waiter, stale_skip=0). Flip count
+  frozen at 617 (flipPendingNum=0), vblank counter reaches 4679 (~78 s) => present thread alive
+  and ticking; the game itself stops submitting flips (it is loading).
+- gdb (launched under gdb, ptrace_scope=1): 52 threads, all parked in libc except ONE guest
+  thread executing JIT code; SIGILL trap at that moment is the normal x64-emulator fallback
+  (hostException.cpp), not a crash. No deadlock.
+- Conclusion: "freeze/black screen/menu never appears" = an extraordinarily slow loading phase
+  after the intro/autosave, not an emulator lock-up.
+
+## Iteration 22 - load-phase measurements
+- The load does: ~32 MiB texture uploads (~32640 KiB avg, 548-870 MB/s), full-4K compute grids
+  (129600 groups), ongoing shader compiles (VS/PS/CS counts climb to the end).
+- SKIP_COMPUTE lifted the same phase 4->10 fps => compute execution dominates it.
+- Pipeline cache: loads/saves fine (24 MB PPSA26893.bin); per-run recompiler count unchanged
+  (516/497) => cache is not the load bottleneck. KYTY_RENDER_SCALE=1 = native (only <1 scales).
+- Ruled out for the freeze/load: readback waits, event stealing, stale generations, guest-pause
+  branch, present-thread stall, vblank delivery, pipeline cache.
+
+## Next steps (for a fresh session)
+1. Instrument the compute storm with GPU timestamps (per-dispatch QueryPool) to split execution
+   vs serialization - this decides the fix direction.
+2. Identify the 4K-sized work: is it the game's asset resolution or keyed off a display query we
+   answer? (VideoOutGetOutputStatus reports resolution=1 for 720p window; capture what the game
+   asks/reads at load.)
+3. Freeze parity: check whether the 48 s present gaps correlate with the present-dump path only
+   (harness) or also occur plain.
+
+## Session commits
+- 814ea3d compute phase timing; ffbb70d shader compile addr->hash map; 47b11c7 present-tick /
+  vtrig / compute ablation diagnostics.
+
