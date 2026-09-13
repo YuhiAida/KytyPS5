@@ -358,6 +358,13 @@ struct PipelineCache::ProgramCache {
 			case ShaderType::Compute: label = "ShaderRecompiler CS"; break;
 			default: EXIT("invalid pipeline shader stage\n");
 		}
+		{
+			static std::atomic<uint32_t> compile_log_count {0};
+			if (compile_log_count.fetch_add(1, std::memory_order_relaxed) < 4096) {
+				LOGF("ShaderCompile: %s addr=0x%016" PRIx64 " hash=0x%016" PRIx64 "\n", label,
+				     reinterpret_cast<uint64_t>(params.code.data()), params.hash);
+			}
+		}
 		ShaderRecompiler::CompileOptions options;
 		options.stage       = stage;
 		options.shader_hash = params.hash;
