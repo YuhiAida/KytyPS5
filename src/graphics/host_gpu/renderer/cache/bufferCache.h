@@ -13,7 +13,6 @@
 
 #include <atomic>
 #include <map>
-#include <memory>
 #include <span>
 #include <utility>
 #include <vector>
@@ -109,14 +108,8 @@ private:
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
-	// Downloads queued by garbage collection publish asynchronously (GPU copies plus deferred
-	// writebacks on the priority thread). A batch is complete once its counter reaches zero.
-	struct WritebackBatch {
-		std::atomic<uint32_t> pending {0};
-	};
 	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
-	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                                        const std::shared_ptr<WritebackBatch>& batch = {});
+	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -139,15 +132,6 @@ private:
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
 	std::atomic_bool m_force_collection_requested {false};
-	// Buffers whose downloads are still publishing. Released by a later collection pass once
-	// their batch has completed and no newer GPU writes exist (see RunGarbageCollector).
-	struct PendingRelease {
-		BufferId id;
-		uint64_t address;
-		uint64_t size;
-	};
-	std::vector<PendingRelease>     m_pending_release;
-	std::shared_ptr<WritebackBatch> m_pending_batch;
 };
 
 } // namespace Libs::Graphics
