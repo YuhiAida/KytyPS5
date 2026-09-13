@@ -216,13 +216,17 @@ private:
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	Common::Mutex m_mutex;
-	uint32_t      m_unsaved_pipelines = 0;
+	// Serializes expensive compiles (shader translation/SPIR-V/module creation and driver
+	// pipeline creation; the driver pipeline cache requires external synchronization). Lookups
+	// never wait on it. Lock order, where both are needed: m_compile_mutex -> m_mutex.
+	Common::Mutex                         m_compile_mutex;
+	uint32_t                              m_unsaved_pipelines = 0;
 	std::chrono::steady_clock::time_point m_last_save {};
 	std::string                           m_signature_suffix;
 
 	void InitializeDriverCache();
 	void SaveInternal(bool destroy);
-	// Throttled mid-run save (called with m_mutex held).
+	// Throttled mid-run save (called with m_compile_mutex held).
 	void MaybeSaveInternal();
 };
 

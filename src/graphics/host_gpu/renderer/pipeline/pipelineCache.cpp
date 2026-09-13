@@ -297,9 +297,13 @@ struct PipelineCache::ProgramCache {
 		};
 	}
 
+	// Lookup-only fast path: cache_mutex is held just for the map access. Compilation (the slow
+	// path below) runs with cache_mutex released and compile_mutex held, so dispatches/draws on
+	// other threads never wait behind a translation or a driver compile.
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
-	                  uint32_t& push_data_cursor) {
+	                  uint32_t& push_data_cursor, Common::Mutex& cache_mutex,
+	                  Common::Mutex& compile_mutex) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.mesh.threads_num[0] != 0 ? ShaderType::Mesh : ShaderType::Vertex;
@@ -310,12 +314,16 @@ struct PipelineCache::ProgramCache {
 			stage = ShaderType::Compute;
 		}
 
-		lookup_key.stage           = stage;
-		lookup_key.hash            = params.hash;
-		lookup_key.user_data_count = static_cast<uint32_t>(params.user_data.size());
-		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
-		BuildStageStaticKey(input_info, lookup_key.static_state);
-		auto                                         entry = programs.find(lookup_key);
+		ProgramKey key {};
+		key.static_state.reserve(MaxStaticKeyWords);
+		key.stage           = stage;
+		key.hash            = params.hash;
+		key.user_data_count = static_cast<uint32_t>(params.user_data.size());
+		key.code_size       = static_cast<uint32_t>(params.code.size());
+		BuildStageStaticKey(input_info, key.static_state);
+
+		cache_mutex.Lock();
+		auto                                         entry = programs.find(key);
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
@@ -338,9 +346,47 @@ struct PipelineCache::ProgramCache {
 				input_info.stage = {.program   = &permutation->program,
 				                    .resources = std::move(resources)};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
-				return permutation->handle;
+				const auto handle = permutation->handle;
+				cache_mutex.Unlock();
+				return handle;
 			}
 		}
+		cache_mutex.Unlock();
+
+		// Slow path: serialize with other compiles (this also keeps the driver pipeline cache
+		// externally synchronized), but not with lookups.
+		compile_mutex.Lock();
+		cache_mutex.Lock();
+		if (const auto recheck = programs.find(key); recheck != programs.end()) {
+			ShaderRecompiler::IR::ResourceSnapshot       recheck_resources;
+			ShaderRecompiler::IR::ResourceSpecialization recheck_specialization;
+			const ShaderRecompiler::IR::SrtRuntime       recheck_runtime {
+			    .user_data                  = params.user_data,
+			    .shader_base                = params.Base(),
+			    .read_specialization_memory = ReadShaderGuestMemory,
+			};
+			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+			    recheck->second.resource_plan, recheck_runtime, recheck_resources,
+			    recheck_specialization));
+			if (const auto permutation = std::ranges::find_if(
+			        recheck->second.permutations, [&](const Permutation& candidate) {
+				        const auto& layout = candidate.program.bindings;
+				        return layout.push_data_start_dword ==
+				                   ShaderRecompiler::IR::PushData::StartFor(
+				                       push_data_cursor, layout.ShaderDataDwords()) &&
+				               candidate.specialization == recheck_specialization;
+				        });
+			    permutation != recheck->second.permutations.end()) {
+				input_info.stage = {.program   = &permutation->program,
+				                    .resources = std::move(recheck_resources)};
+				permutation->program.bindings.AdvancePushData(push_data_cursor);
+				const auto handle = permutation->handle;
+				cache_mutex.Unlock();
+				compile_mutex.Unlock();
+				return handle;
+			}
+		}
+		cache_mutex.Unlock();
 
 		ShaderStageInputInfo stage_input {};
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
@@ -385,12 +431,17 @@ struct PipelineCache::ProgramCache {
 			options.wave_size = input_info.wave_size;
 		}
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+
+		cache_mutex.Lock();
+		// No other thread can commit a program while compile_mutex is held; a same-key entry
+		// here can only be the one the recheck above already rejected.
+		entry = programs.find(key);
 		if (entry == programs.end()) {
 			auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-			                                                    specialization));
-			entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
+			entry = programs.try_emplace(key, std::move(resource_plan)).first;
 		}
+		EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan, runtime,
+		                                                    resources, specialization));
 		entry->second.permutations.push_back(CompilePermutation(
 		    params, options, std::move(translated), std::move(specialization), push_data_cursor));
 		const auto& permutation = entry->second.permutations.back();
@@ -401,18 +452,19 @@ struct PipelineCache::ProgramCache {
 		for (const auto& [key, source]: programs) {
 			counts[static_cast<size_t>(key.stage)] += source.permutations.size();
 		}
+		const auto handle = permutation.handle;
+		cache_mutex.Unlock();
+		compile_mutex.Unlock();
 		// Guest geometry shaders are compiled through the host mesh stage.
 		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu\n",
 		            counts[static_cast<size_t>(ShaderType::Vertex)],
 		            counts[static_cast<size_t>(ShaderType::Pixel)],
 		            counts[static_cast<size_t>(ShaderType::Compute)],
 		            counts[static_cast<size_t>(ShaderType::Mesh)]);
-		return permutation.handle;
+		return handle;
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {
-		lookup_key.static_state.reserve(MaxStaticKeyWords);
-	}
+	explicit ProgramCache(vk::Device device): device(device) {}
 	~ProgramCache() {
 		for (const auto& [key, entry]: programs) {
 			(void)key;
@@ -423,7 +475,6 @@ struct PipelineCache::ProgramCache {
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
-	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
 };
@@ -553,22 +604,33 @@ void PipelineCache::InitializeDriverCache() {
 }
 
 void PipelineCache::Save() {
-	Common::LockGuard lock(m_mutex);
+	Common::LockGuard lock(m_compile_mutex);
 	SaveInternal(true);
 }
 
 void PipelineCache::MaybeSaveInternal() {
-	if (m_driver_cache == nullptr || m_unsaved_pipelines < 64) {
+	// Called with m_compile_mutex held: the driver cache is only touched from compile sections.
+	if (m_driver_cache == nullptr) {
 		return;
 	}
-	const auto now = std::chrono::steady_clock::now();
-	if (m_last_save != std::chrono::steady_clock::time_point {} &&
-	    now - m_last_save < std::chrono::seconds(120)) {
-		return;
+	bool due = false;
+	{
+		Common::LockGuard lock(m_mutex);
+		if (m_unsaved_pipelines < 64) {
+			return;
+		}
+		const auto now = std::chrono::steady_clock::now();
+		if (m_last_save != std::chrono::steady_clock::time_point {} &&
+		    now - m_last_save < std::chrono::seconds(120)) {
+			return;
+		}
+		m_unsaved_pipelines = 0;
+		m_last_save         = now;
+		due                 = true;
 	}
-	m_unsaved_pipelines = 0;
-	m_last_save         = now;
-	SaveInternal(false);
+	if (due) {
+		SaveInternal(false);
+	}
 }
 
 void PipelineCache::SaveInternal(bool destroy) {
@@ -675,14 +737,15 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 		clip.enabled = true;
 	}
-	Common::LockGuard lock(m_mutex);
-	uint32_t          push_data_cursor =
+	uint32_t         push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
-	GraphicsPrograms  result;
+	GraphicsPrograms result;
 	if (pixel_active) {
-		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor, m_mutex,
+		                                    m_compile_mutex);
 	}
-	result.vertex = m_program_cache->Get(vertex_params, vertex_info, push_data_cursor);
+	result.vertex =
+	    m_program_cache->Get(vertex_params, vertex_info, push_data_cursor, m_mutex, m_compile_mutex);
 	return result;
 }
 
@@ -691,9 +754,8 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
                                                ShaderComputeInputInfo&      input_info) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
-	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor = 0;
-	return m_program_cache->Get(params, input_info, push_data_cursor);
+	return m_program_cache->Get(params, input_info, push_data_cursor, m_mutex, m_compile_mutex);
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {
@@ -714,8 +776,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	EXIT_IF(ps_active && !pixel_program);
 	const auto color_count = static_cast<uint32_t>(colors.size());
 
-	Common::LockGuard lock(m_mutex);
-	auto&             ctx = command.GetRegisters();
+	auto& ctx = command.GetRegisters();
 
 	const HW::ModeControl& mc = ctx.GetModeControl();
 
@@ -836,8 +897,20 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		EXIT_IF(attributes_num != static_cast<uint32_t>(vs_input_info.resources_num));
 	}
 
-	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-		return *iter->second;
+	{
+		Common::LockGuard lock(m_mutex);
+		if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+			return *iter->second;
+		}
+	}
+
+	// Creation runs under m_compile_mutex only (see GetComputePipeline).
+	Common::LockGuard compile_lock(m_compile_mutex);
+	{
+		Common::LockGuard lock(m_mutex);
+		if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+			return *iter->second;
+		}
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -860,12 +933,17 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
-	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
-	EXIT_IF(!inserted);
-	m_unsaved_pipelines++;
+	Pipeline* result = nullptr;
+	{
+		Common::LockGuard lock(m_mutex);
+		auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+		EXIT_IF(!inserted);
+		result = iter->second.get();
+		m_unsaved_pipelines++;
+	}
 	MaybeSaveInternal();
 
-	return *iter->second;
+	return *result;
 }
 
 PipelineCache::Pipeline&
@@ -875,11 +953,22 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	EXIT_IF(!compute_program);
 
-	Common::LockGuard lock(m_mutex);
+	{
+		Common::LockGuard lock(m_mutex);
+		if (auto iter = m_compute_pipelines.find(compute_program.id);
+		    iter != m_compute_pipelines.end()) {
+			return *iter->second;
+		}
+	}
 
-	if (auto iter = m_compute_pipelines.find(compute_program.id);
-	    iter != m_compute_pipelines.end()) {
-		return *iter->second;
+	// Creation runs under m_compile_mutex only, so lookups on other threads never wait for it.
+	Common::LockGuard compile_lock(m_compile_mutex);
+	{
+		Common::LockGuard lock(m_mutex);
+		if (auto iter = m_compute_pipelines.find(compute_program.id);
+		    iter != m_compute_pipelines.end()) {
+			return *iter->second;
+		}
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -892,11 +981,16 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
-	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
-	EXIT_IF(!inserted);
-	m_unsaved_pipelines++;
+	Pipeline* result = nullptr;
+	{
+		Common::LockGuard lock(m_mutex);
+		auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
+		EXIT_IF(!inserted);
+		result = iter->second.get();
+		m_unsaved_pipelines++;
+	}
 	MaybeSaveInternal();
 
-	return *iter->second;
+	return *result;
 }
 } // namespace Libs::Graphics

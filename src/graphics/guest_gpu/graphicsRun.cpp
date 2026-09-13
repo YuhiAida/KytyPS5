@@ -1440,9 +1440,27 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			}
 		}
 
+		const auto call_begin = std::chrono::steady_clock::now();
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
 		                                              thread_group_y, thread_group_z, mode,
 		                                              indirect_args_addr);
+		if (std::getenv("KYTY_COMPUTE_LOG") != nullptr) {
+			static std::atomic<uint64_t> acc_ns {0};
+			static std::atomic<uint64_t> acc_n {0};
+			static auto                  last = std::chrono::steady_clock::now();
+			acc_ns.fetch_add(static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(
+			        std::chrono::steady_clock::now() - call_begin)
+			        .count()));
+			acc_n.fetch_add(1);
+			const auto now = std::chrono::steady_clock::now();
+			if (now - last >= std::chrono::seconds(1)) {
+				LOGF("GpuCall: n=%llu total=%.0f ms/s\n",
+				     static_cast<unsigned long long>(acc_n.exchange(0)),
+				     static_cast<double>(acc_ns.exchange(0)) / 1.0e6);
+				last = now;
+			}
+		}
 	}
 
 	/*constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;

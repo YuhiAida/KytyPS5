@@ -418,3 +418,56 @@ Phase attribution if needed first: `LogDrawPhase` (debug.cpp:618, gated by
   identify the missing event, find the emulator side that should trigger it (user-event or device
   ioctl path), implement, and verify fps + menu-load time.
 
+## Iteration 24 - timeout idents logged (negative)
+- Extended the timeout log with filter/ident. Results: RHIInterruptThread 10,175 timeouts @ ~5 ms
+  timo, RHISubmissionThread 7,368 @ ~4 ms, SonyIOManager 1,085 @ 100 ms (99.7% timeouts). All
+  filter=0 (= untouched output buffer, the ev[] array is OUTPUT in wait-equeue). 12,918 user
+  triggers fired, so the e-queue system works; these are the game's normal polls. Not the cause.
+
+## Iteration 25 - dispatch-path lock stall found AND FIXED (verified)
+- Instrumented the untimed dispatch segments: `GpuCall total=674-716 ms/s` for ~590 dispatches/s
+  (alternating with 42-45 ms/s seconds); the renderer `Compute: program=` segment mirrored it
+  (28 vs 656-699 ms/s). Accounting closes: GpuCall ~= program + bindings + dispatch.
+- Root cause: `GetComputeProgram` -> `ProgramCache::Get` performs ShaderRecompiler::TranslateProgram
+  + CompileProgram + shader-module creation while the caller holds the global PipelineCache mutex.
+  `GetGraphicsPipeline` / `GetComputePipeline` likewise run CreatePipelineInternal (driver
+  compile) under it. The loader compiles hundreds of shaders; every dispatch/draw lookup on other
+  threads blocked behind a compile.
+- Fix (kept, committed): new `m_compile_mutex` serializes compiles (also required: VkPipelineCache
+  needs external synchronization); `m_mutex` now only guards maps/state. ProgramCache::Get releases
+  the cache mutex around translation and re-acquires for a double-checked commit; pipeline getters
+  create outside the lock with a re-check under the compile mutex. Lock order: compile -> cache.
+- Verified (`_Build/linux/unlock_guestlog.txt` vs `lock_guestlog.txt`): GpuCall 674 -> 27-40 ms/s,
+  program 699 -> 8-9 ms/s, lock/pop/endr ~0, no crash, same slow-phase fps otherwise.
+
+## Iteration 26 - frame limiter: GC drain (located; fix attempted; REVERTED)
+- Post-lock-fix slow phase: `Sub: slow 589-645 ms (translate=0/6 gc=579-645)`.
+  `BufferCache::RunGarbageCollector` drains the whole GPU queue (`m_scheduler.Wait(CurrentTick())`
+  + WaitPriorityOperations) when retiring GPU-dirty buffers.
+- Attempt A: defer release until `m_scheduler.IsFree(tick)` with a pending list -> hit
+  `EXIT("garbage collection retained GPU ownership")`: with deferral the GPU can legitimately
+  re-dirty a range before release.
+- Attempt B: re-check + skip instead of EXIT; keep WaitPriorityOperations for the
+  publish-before-release ordering -> still blocks on the priority writeback backlog
+  (gc=1261 ms observed). Dropping that wait would let guest reads see stale memory (reads are
+  GPU-thread serialized and trust the tracker/RangeSet state).
+- Decision: REVERTED (git checkout). Proper fix needs completion-tracked writebacks (release only
+  buffers whose writeback op has run; no queue drain) - design-level, not a drive-by.
+- Note: `KYTY_SKIP_READBACK=1` crashed the guest (SIGSEGV in guest code) on stale readbacks -
+  diagnostic only, cannot be used as a fix.
+
+## Iteration 27 - remaining drains (open)
+- `Sub: slow (translate=193-1039 ms)` remain in the slow phase. Prime suspect:
+  `BufferCache::ReadMemory` drains the queue on every CPU read of GPU-written memory
+  (`m_scheduler.Wait(CurrentTick())`; structural - the guest read needs the copy completed).
+  Secondary: indirect-buffer command reads from GPU-written memory go through the same path.
+- Slow-phase fps unchanged (~1.0-1.4); CPU ~1 core; GPU ~44%.
+- Next step options: (a) completion-tracked GC + readback releases (the real fix),
+  (b) batch/defer guest-visible readbacks where the guest polls instead of consuming
+  immediately, (c) revisit render-scale work once the waits are gone to see what the fps
+  ceiling becomes.
+
+## Session commits (cont.)
+- 47b11c7 present-tick / vtrig / compute ablations; this round: pipelineCache lock split
+  (compile outside m_mutex), GpuCall + extended Compute timing, equeue timeout idents.
+

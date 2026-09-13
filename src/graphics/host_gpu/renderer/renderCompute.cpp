@@ -207,8 +207,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_z, uint32_t mode,
                                     uint64_t indirect_args_addr) {
 	EXIT_IF(buffer.IsInvalid());
+	const auto compute_te0 = std::chrono::steady_clock::now();
 	const bool gpu_indirect = indirect_args_addr != 0;
 	m_context.GetCommandScheduler().PopPendingOperations();
+	const auto compute_te1 = std::chrono::steady_clock::now();
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -216,7 +218,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    thread_group_x, thread_group_y, thread_group_z, mode,
 	                    sh_ctx.GetCs().cs_regs.data_addr);
 
+	const auto        compute_tl0 = std::chrono::steady_clock::now();
 	Common::LockGuard lock(m_context.GetMutex());
+	const auto        compute_tl1 = std::chrono::steady_clock::now();
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
 		     "groups=%ux%ux%u mode=%u\n",
@@ -373,6 +377,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
+	const auto compute_tm0 = std::chrono::steady_clock::now();
 	buffer.EndRendering();
 	const auto compute_t2 = std::chrono::steady_clock::now();
 	auto& pipeline =
@@ -423,6 +428,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		static std::atomic<uint64_t> t_pipeline {0};
 		static std::atomic<uint64_t> t_bindings {0};
 		static std::atomic<uint64_t> t_dispatch {0};
+		static std::atomic<uint64_t> t_pop {0};
+		static std::atomic<uint64_t> t_lock {0};
+		static std::atomic<uint64_t> t_endr {0};
 		static std::atomic<uint64_t> t_count {0};
 		static auto                  last = std::chrono::steady_clock::now();
 		const auto ns = [](auto a, auto b) {
@@ -433,15 +441,22 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		t_pipeline.fetch_add(ns(compute_t2, compute_t3));
 		t_bindings.fetch_add(ns(compute_t3, compute_t4));
 		t_dispatch.fetch_add(ns(compute_t4, compute_t5));
+		t_pop.fetch_add(ns(compute_te0, compute_te1));
+		t_lock.fetch_add(ns(compute_tl0, compute_tl1));
+		t_endr.fetch_add(ns(compute_tm0, compute_t2));
 		t_count.fetch_add(1);
 		const auto now = std::chrono::steady_clock::now();
 		if (now - last >= std::chrono::seconds(1)) {
-			LOGF("Compute: n=%llu program=%.0f pipeline=%.0f bindings=%.0f dispatch=%.0f ms/s\n",
+			LOGF("Compute: n=%llu program=%.0f pipeline=%.0f bindings=%.0f dispatch=%.0f "
+			     "pop=%.0f lock=%.0f endr=%.0f ms/s\n",
 			     static_cast<unsigned long long>(t_count.exchange(0)),
 			     static_cast<double>(t_program.exchange(0)) / 1.0e6,
 			     static_cast<double>(t_pipeline.exchange(0)) / 1.0e6,
 			     static_cast<double>(t_bindings.exchange(0)) / 1.0e6,
-			     static_cast<double>(t_dispatch.exchange(0)) / 1.0e6);
+			     static_cast<double>(t_dispatch.exchange(0)) / 1.0e6,
+			     static_cast<double>(t_pop.exchange(0)) / 1.0e6,
+			     static_cast<double>(t_lock.exchange(0)) / 1.0e6,
+			     static_cast<double>(t_endr.exchange(0)) / 1.0e6);
 			last = now;
 		}
 	}

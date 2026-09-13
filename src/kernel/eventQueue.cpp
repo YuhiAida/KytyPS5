@@ -409,6 +409,9 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 	     (timo == nullptr ? "inf" : fmt::format("{}", *timo).c_str()),
 	     Common::Thread::GetThreadIdUnique());
 
+	const int      request_filter = num > 0 ? static_cast<int>(ev[0].filter) : -1;
+	const uint64_t request_ident  = num > 0 ? static_cast<uint64_t>(ev[0].ident) : 0;
+
 	if (timo == nullptr) {
 		*out = owner->WaitForEvents(ev, num, 0);
 	}
@@ -425,7 +428,8 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 		return KERNEL_ERROR_EBADF;
 	}
 	if (*out == 0) {
-		LOGF("\tEqueue wait timedout: %s\n", owner->GetName().c_str());
+		LOGF("\tEqueue wait timedout: %s (filter=%d ident=0x%016" PRIx64 ", num=%d)\n",
+		     owner->GetName().c_str(), request_filter, request_ident, num);
 		return KERNEL_ERROR_ETIMEDOUT;
 	}
 
