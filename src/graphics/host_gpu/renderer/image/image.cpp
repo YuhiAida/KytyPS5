@@ -132,6 +132,57 @@ void ValidateOptionalRange(GuestRange range, const char* name) {
 	}
 }
 
+// Resampling transfers (render scale): the guest extent and the host backing extent differ, so
+// the data moves through a staging image at the guest extent and a blit converts between the two.
+// Maps a guest texel-space copy region onto a blit whose two sides may live on images with
+// different extents (guest extent vs scaled host extent). Returns false when the region collapses
+// after clamping, in which case it must be dropped: an out-of-bounds blit is undefined behaviour.
+bool ScaledBlitRegion(const vk::BufferImageCopy& copy, const vk::Extent3D& guest_extent,
+                      const vk::Extent3D& host_extent, bool host_is_source, vk::ImageBlit& region) {
+	const auto mip = copy.imageSubresource.mipLevel;
+	const auto gx  = std::max(1u, guest_extent.width >> mip);
+	const auto gy  = std::max(1u, guest_extent.height >> mip);
+	const auto gz  = std::max(1u, guest_extent.depth >> mip);
+	const auto hx  = std::max(1u, host_extent.width >> mip);
+	const auto hy  = std::max(1u, host_extent.height >> mip);
+	const auto hz  = std::max(1u, host_extent.depth >> mip);
+	const auto sx  = static_cast<double>(hx) / static_cast<double>(gx);
+	const auto sy  = static_cast<double>(hy) / static_cast<double>(gy);
+	const auto sz  = static_cast<double>(hz) / static_cast<double>(gz);
+
+	const auto clamp = [](int32_t v, int32_t lo, int32_t hi) { return std::min(std::max(v, lo), hi); };
+
+	const auto x0 = clamp(static_cast<int32_t>(copy.imageOffset.x), 0, static_cast<int32_t>(gx));
+	const auto y0 = clamp(static_cast<int32_t>(copy.imageOffset.y), 0, static_cast<int32_t>(gy));
+	const auto z0 = clamp(static_cast<int32_t>(copy.imageOffset.z), 0, static_cast<int32_t>(gz));
+	const auto x1 = clamp(x0 + static_cast<int32_t>(copy.imageExtent.width), 0, static_cast<int32_t>(gx));
+	const auto y1 = clamp(y0 + static_cast<int32_t>(copy.imageExtent.height), 0, static_cast<int32_t>(gy));
+	const auto z1 = clamp(z0 + static_cast<int32_t>(copy.imageExtent.depth), 0, static_cast<int32_t>(gz));
+	if (x1 <= x0 || y1 <= y0 || z1 <= z0) {
+		return false;
+	}
+
+	const auto guest_offsets = std::array {vk::Offset3D {x0, y0, z0}, vk::Offset3D {x1, y1, z1}};
+	const auto host_offsets =
+	    std::array {vk::Offset3D {clamp(static_cast<int32_t>(std::floor(x0 * sx)), 0, static_cast<int32_t>(hx)),
+	                              clamp(static_cast<int32_t>(std::floor(y0 * sy)), 0, static_cast<int32_t>(hy)),
+	                              clamp(static_cast<int32_t>(std::floor(z0 * sz)), 0, static_cast<int32_t>(hz))},
+	                vk::Offset3D {clamp(static_cast<int32_t>(std::ceil(x1 * sx)), 0, static_cast<int32_t>(hx)),
+	                              clamp(static_cast<int32_t>(std::ceil(y1 * sy)), 0, static_cast<int32_t>(hy)),
+	                              clamp(static_cast<int32_t>(std::ceil(z1 * sz)), 0, static_cast<int32_t>(hz))}};
+	if (host_offsets[1].x <= host_offsets[0].x || host_offsets[1].y <= host_offsets[0].y ||
+	    host_offsets[1].z <= host_offsets[0].z) {
+		return false;
+	}
+
+	region.srcSubresource = {vk::ImageAspectFlagBits::eColor, mip, copy.imageSubresource.baseArrayLayer,
+	                         copy.imageSubresource.layerCount};
+	region.dstSubresource = region.srcSubresource;
+	region.srcOffsets     = host_is_source ? host_offsets : guest_offsets;
+	region.dstOffsets     = host_is_source ? guest_offsets : host_offsets;
+	return true;
+}
+
 } // namespace
 
 vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
@@ -271,6 +322,16 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
                    uint64_t size) {
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
+	if ((host_scale_x != 1.0f || host_scale_y != 1.0f) &&
+	    ResampleUpload(copies, buffer, offset, size)) {
+		return;
+	}
+	UploadDirect(copies, buffer, offset, size);
+}
+
+void Image::UploadDirect(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer,
+                         uint64_t offset, uint64_t size) {
+	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
 	std::vector<vk::BufferImageCopy> clamped;
 	if (CopiesExceedExtent(copies, backing.extent)) {
 		clamped.assign(copies.begin(), copies.end());
@@ -317,6 +378,16 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer,
                      uint64_t offset, uint64_t size) {
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
+	if ((host_scale_x != 1.0f || host_scale_y != 1.0f) &&
+	    ResampleDownload(copies, buffer, offset, size)) {
+		return;
+	}
+	DownloadDirect(copies, buffer, offset, size);
+}
+
+void Image::DownloadDirect(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer,
+                           uint64_t offset, uint64_t size) {
+	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
 	std::vector<vk::BufferImageCopy> clamped;
 	if (CopiesExceedExtent(copies, backing.extent)) {
 		clamped.assign(copies.begin(), copies.end());
@@ -357,6 +428,204 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 	dependency.imageMemoryBarrierCount = 0;
 	dependency.pImageMemoryBarriers    = nullptr;
 	command.pipelineBarrier2(dependency);
+}
+
+bool Image::ResampleUpload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer,
+                           uint64_t offset, uint64_t size) {
+	if (std::getenv("KYTY_RENDER_SCALE_NO_RESAMPLE") != nullptr) {
+		return false;
+	}
+	const auto features = m_graphics.GetFormatProperties(backing.format).optimalTilingFeatures;
+	if (!static_cast<bool>(features & (vk::FormatFeatureFlagBits::eBlitSrc |
+	                                   vk::FormatFeatureFlagBits::eBlitDst))) {
+		return false;
+	}
+	const auto filter = static_cast<bool>(features & vk::FormatFeatureFlagBits::eSampledImageFilterLinear)
+	                        ? vk::Filter::eLinear
+	                        : vk::Filter::eNearest;
+	std::vector<vk::BufferImageCopy> clamped;
+	if (CopiesExceedExtent(copies, info.extent)) {
+		clamped.assign(copies.begin(), copies.end());
+		ClampCopies(clamped, info.extent);
+		ReportScaledCopyClamp("upload", info.extent, info.data.address);
+		copies = clamped;
+	}
+	if (std::getenv("KYTY_RENDER_SCALE_LOG") != nullptr) {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+			const auto& c = copies.front();
+			LOGF("RenderScale: resample upload guest=%ux%u host=%ux%u copies=%zu mip=%u layer=%u/%u "
+			     "offset=%u,%u extent=%ux%u\n",
+			     info.extent.width, info.extent.height, backing.extent.width, backing.extent.height,
+			     copies.size(), c.imageSubresource.mipLevel, c.imageSubresource.baseArrayLayer,
+			     c.imageSubresource.layerCount, c.imageOffset.x, c.imageOffset.y,
+			     c.imageExtent.width, c.imageExtent.height);
+		}
+	}
+
+	// A real guest-extent image is used as staging so the proven transition path applies; it stays
+	// alive until the command buffer reading it has completed.
+	auto* staging = new Image(m_graphics, m_scheduler, info, 1.0f, 1.0f);
+	m_scheduler.DeferOperation([staging] { delete staging; });
+
+	m_scheduler.EndRendering();
+	auto command = m_scheduler.Current().Handle();
+
+	vk::BufferMemoryBarrier2 buffer_barrier {};
+	buffer_barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	buffer_barrier.srcAccessMask       = vk::AccessFlagBits2::eMemoryWrite;
+	buffer_barrier.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+	buffer_barrier.dstAccessMask       = vk::AccessFlagBits2::eTransferRead;
+	buffer_barrier.srcQueueFamilyIndex = vk::QueueFamilyIgnored;
+	buffer_barrier.dstQueueFamilyIndex = vk::QueueFamilyIgnored;
+	buffer_barrier.buffer              = buffer;
+	buffer_barrier.offset              = offset;
+	buffer_barrier.size                = size;
+	vk::DependencyInfo dependency {};
+	dependency.bufferMemoryBarrierCount = 1;
+	dependency.pBufferMemoryBarriers    = &buffer_barrier;
+	command.pipelineBarrier2(dependency);
+
+	staging->Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
+	                 command);
+	command.copyBufferToImage(buffer, staging->backing.image, vk::ImageLayout::eTransferDstOptimal,
+	                          static_cast<uint32_t>(copies.size()), copies.data());
+	staging->Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
+	                 command);
+	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+
+	std::vector<vk::ImageBlit> regions;
+	regions.reserve(copies.size());
+	for (const auto& copy : copies) {
+		vk::ImageBlit region {};
+		if (ScaledBlitRegion(copy, info.extent, backing.extent, false, region)) {
+			regions.push_back(region);
+		}
+	}
+	if (regions.empty()) {
+		if (std::getenv("KYTY_RENDER_SCALE_LOG") != nullptr) {
+			LOGF("RenderScale: resample upload had no non-empty blit region (%zu copies)\n", copies.size());
+		}
+		return true;
+	}
+	if (std::getenv("KYTY_RENDER_SCALE_LOG") != nullptr) {
+		static std::atomic<uint32_t> blit_log {0};
+		if (blit_log.fetch_add(1, std::memory_order_relaxed) < 4) {
+			const auto& b = regions.front();
+			LOGF("RenderScale: blit %ux%u[%d,%d %ux%u] -> %ux%u[%d,%d %ux%u] fmt=%u/%u usage=%u/%u "
+			     "filter=%u\n",
+			     staging->backing.extent.width, staging->backing.extent.height, b.srcOffsets[0].x,
+			     b.srcOffsets[0].y, b.srcOffsets[1].x - b.srcOffsets[0].x,
+			     b.srcOffsets[1].y - b.srcOffsets[0].y, backing.extent.width, backing.extent.height,
+			     b.dstOffsets[0].x, b.dstOffsets[0].y, b.dstOffsets[1].x - b.dstOffsets[0].x,
+			     b.dstOffsets[1].y - b.dstOffsets[0].y, static_cast<uint32_t>(staging->backing.format),
+			     static_cast<uint32_t>(backing.format), static_cast<uint32_t>(staging->backing.usage),
+			     static_cast<uint32_t>(backing.usage), static_cast<uint32_t>(filter));
+		}
+	}
+	// Bisect gate: KYTY_RENDER_SCALE_NO_BLIT=1 records the staging copy only.
+	if (std::getenv("KYTY_RENDER_SCALE_NO_BLIT") == nullptr) {
+		command.blitImage(staging->backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
+		                  vk::ImageLayout::eTransferDstOptimal,
+		                  static_cast<uint32_t>(regions.size()), regions.data(), filter);
+	}
+
+	buffer_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	buffer_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead;
+	buffer_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	buffer_barrier.dstAccessMask =
+	    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	dependency.imageMemoryBarrierCount = 0;
+	dependency.pImageMemoryBarriers    = nullptr;
+	dependency.bufferMemoryBarrierCount = 1;
+	dependency.pBufferMemoryBarriers    = &buffer_barrier;
+	command.pipelineBarrier2(dependency);
+
+	Transit(vk::ImageLayout::eGeneral,
+	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
+	return true;
+}
+
+bool Image::ResampleDownload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer,
+                             uint64_t offset, uint64_t size) {
+	if (std::getenv("KYTY_RENDER_SCALE_NO_RESAMPLE") != nullptr) {
+		return false;
+	}
+	const auto features = m_graphics.GetFormatProperties(backing.format).optimalTilingFeatures;
+	if (!static_cast<bool>(features & (vk::FormatFeatureFlagBits::eBlitSrc |
+	                                   vk::FormatFeatureFlagBits::eBlitDst))) {
+		return false;
+	}
+	const auto filter = static_cast<bool>(features & vk::FormatFeatureFlagBits::eSampledImageFilterLinear)
+	                        ? vk::Filter::eLinear
+	                        : vk::Filter::eNearest;
+	std::vector<vk::BufferImageCopy> clamped;
+	if (CopiesExceedExtent(copies, info.extent)) {
+		clamped.assign(copies.begin(), copies.end());
+		ClampCopies(clamped, info.extent);
+		ReportScaledCopyClamp("download", info.extent, info.data.address);
+		copies = clamped;
+	}
+
+	auto* staging = new Image(m_graphics, m_scheduler, info, 1.0f, 1.0f);
+	m_scheduler.DeferOperation([staging] { delete staging; });
+
+	m_scheduler.EndRendering();
+	auto command = m_scheduler.Current().Handle();
+
+	vk::BufferMemoryBarrier2 buffer_barrier {};
+	buffer_barrier.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+	buffer_barrier.srcAccessMask =
+	    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	buffer_barrier.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+	buffer_barrier.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+	buffer_barrier.srcQueueFamilyIndex = vk::QueueFamilyIgnored;
+	buffer_barrier.dstQueueFamilyIndex = vk::QueueFamilyIgnored;
+	buffer_barrier.buffer              = buffer;
+	buffer_barrier.offset              = offset;
+	buffer_barrier.size                = size;
+	vk::DependencyInfo dependency {};
+	dependency.bufferMemoryBarrierCount = 1;
+	dependency.pBufferMemoryBarriers    = &buffer_barrier;
+	command.pipelineBarrier2(dependency);
+
+	Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {}, command);
+	staging->Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
+	                 command);
+
+	std::vector<vk::ImageBlit> regions;
+	regions.reserve(copies.size());
+	for (const auto& copy : copies) {
+		vk::ImageBlit region {};
+		if (ScaledBlitRegion(copy, info.extent, backing.extent, true, region)) {
+			regions.push_back(region);
+		}
+	}
+	if (regions.empty()) {
+		if (std::getenv("KYTY_RENDER_SCALE_LOG") != nullptr) {
+			LOGF("RenderScale: resample download had no non-empty blit region (%zu copies)\n",
+			     copies.size());
+		}
+		return true;
+	}
+	command.blitImage(backing.image, vk::ImageLayout::eTransferSrcOptimal, staging->backing.image,
+	                  vk::ImageLayout::eTransferDstOptimal, static_cast<uint32_t>(regions.size()),
+	                  regions.data(), filter);
+
+	staging->Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
+	                 command);
+	command.copyImageToBuffer(staging->backing.image, vk::ImageLayout::eTransferSrcOptimal, buffer,
+	                          static_cast<uint32_t>(copies.size()), copies.data());
+
+	buffer_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	buffer_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	buffer_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	buffer_barrier.dstAccessMask =
+	    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	dependency.imageMemoryBarrierCount = 0;
+	dependency.pImageMemoryBarriers    = nullptr;
+	command.pipelineBarrier2(dependency);
+	return true;
 }
 
 std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
