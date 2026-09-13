@@ -1337,9 +1337,20 @@ KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 			uint32_t thread_group_z;
 		};
 
-		auto* args = reinterpret_cast<const DispatchIndirectArgs*>(
-		    buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u));
-		uint32_t mode = buffer[2];
+		const auto args_addr = buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u);
+		uint32_t   mode      = buffer[2];
+
+		// GPU-side path: forward the args address instead of reading the args on the CPU (that
+		// read page-faults into BufferCache::ReadMemory and waits for the GPU when the args
+		// page is GPU-dirty). Thread-dimension remapping needs the counts, so that mode keeps
+		// the CPU path.
+		constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;
+		if ((mode & DispatchInitiatorUseThreadDimensions) == 0) {
+			cp.DispatchDirect(0, 0, 0, mode, args_addr);
+			return 3;
+		}
+
+		auto* args = reinterpret_cast<const DispatchIndirectArgs*>(args_addr);
 
 		EXIT_NOT_IMPLEMENTED(args == nullptr);
 		cp.DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode);

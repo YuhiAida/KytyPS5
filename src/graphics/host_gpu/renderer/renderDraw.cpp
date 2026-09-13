@@ -705,9 +705,11 @@ static bool ConsumeMetadataColorOperation(const CommandBuffer& buffer) {
 }
 
 struct DrawEmitInfo {
-	int32_t  vertex_offset = 0;
-	uint32_t first_vertex  = 0;
-	uint32_t first_instance = 0;
+	int32_t    vertex_offset = 0;
+	uint32_t   first_vertex  = 0;
+	uint32_t   first_instance = 0;
+	vk::Buffer indirect_args_buffer = nullptr;
+	uint64_t   indirect_args_offset = 0;
 };
 
 struct DrawIndexBufferSource {
@@ -905,6 +907,40 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, bool auto_draw,
 	return true;
 }
 
+// Same decision as ResolvePrimitiveRestart, but for GPU-side indirect draws: the index data
+// cannot be scanned for a custom reset value (that would reintroduce the CPU readback the
+// indirect path exists to remove), so a custom reset value is reported and left unapplied.
+static bool ResolvePrimitiveRestartIndirect(const CommandBuffer&         buffer,
+                                            const DrawIndexBufferSource& source) {
+	const auto control = buffer.GetUserConfig().GetPrimitiveResetControl();
+	EXIT_NOT_IMPLEMENTED((control & ~0x3u) != 0);
+	if ((control & 0x1u) == 0) {
+		return false;
+	}
+	switch (buffer.GetUserConfig().GetPrimType()) {
+		case Prospero::PrimitiveType::kLineStrip:
+		case Prospero::PrimitiveType::kTriFan:
+		case Prospero::PrimitiveType::kTriStrip: break;
+		default: return false;
+	}
+	const auto element_size = source.guest_element_size;
+	const auto index_mask   = UINT32_MAX >> ((4 - element_size) * 8);
+	const auto reset_index  = buffer.GetRegisters().GetPrimitiveResetIndex();
+	if ((control & 0x2u) != 0 && (reset_index & ~index_mask) != 0) {
+		return false;
+	}
+	if ((reset_index & index_mask) == index_mask) {
+		return true;
+	}
+	static std::atomic<uint32_t> log_count {0};
+	if (log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+		LOGF("DrawIndexedIndirect: custom primitive reset value 0x%08" PRIx32
+		     " is not applied (index data is not scanned for indirect draws)\n",
+		     reset_index & index_mask);
+	}
+	return false;
+}
+
 static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
                                     const DrawIndexBufferSource& source) {
 	const auto control = buffer.GetUserConfig().GetPrimitiveResetControl();
@@ -1081,8 +1117,17 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 		case Prospero::PrimitiveType::kTriStrip:
 		case Prospero::PrimitiveType::kRectList:
 			if (draw.IsIndexed()) {
-				vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0, emit.vertex_offset,
-				                      emit.first_instance);
+				if (emit.indirect_args_buffer != nullptr) {
+					vk_buffer.drawIndexedIndirect(emit.indirect_args_buffer,
+					                              emit.indirect_args_offset, 1,
+					                              sizeof(vk::DrawIndexedIndirectCommand));
+				} else {
+					vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0,
+					                      emit.vertex_offset, emit.first_instance);
+				}
+			} else if (emit.indirect_args_buffer != nullptr) {
+				vk_buffer.drawIndirect(emit.indirect_args_buffer, emit.indirect_args_offset, 1,
+				                       sizeof(vk::DrawIndirectCommand));
 			} else {
 				vk_buffer.draw(draw.index_count, draw.instance_count, emit.first_vertex,
 				               emit.first_instance);
@@ -1097,6 +1142,7 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 			vk_buffer.draw(4, draw.instance_count, emit.first_vertex, emit.first_instance);
 			break;
 		case Prospero::PrimitiveType::kQuadListLegacy:
+			EXIT_NOT_IMPLEMENTED(emit.indirect_args_buffer != nullptr);
 			EXIT_NOT_IMPLEMENTED((draw.index_count & 0x3u) != 0);
 			for (uint32_t i = 0; i < draw.index_count; i += 4) {
 				if (draw.IsIndexed()) {
@@ -1119,6 +1165,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                                     bool primitive_restart_enable) {
 	auto& ucfg = buffer.GetUserConfig();
 	const bool mesh_active = state.vs_input_info.stage.program->stage == ShaderType::Mesh;
+	EXIT_NOT_IMPLEMENTED(mesh_active && emit.indirect_args_buffer != nullptr);
 	uint32_t   mesh_groups = 0;
 	if (mesh_active) {
 		const auto& mesh = state.vs_input_info.mesh;
@@ -1255,7 +1302,9 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(buffer.IsInvalid());
-	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
+	const bool gpu_indirect = args.indirect_args_addr != 0;
+	EXIT_IF(!gpu_indirect && args.offset_source == DrawOffsetSource::DrawState &&
+	        args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
@@ -1265,7 +1314,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
 	Common::LockGuard lock(m_context.GetMutex());
-	if (args.index_count == 0 || args.instance_count == 0) {
+	if (!gpu_indirect && (args.index_count == 0 || args.instance_count == 0)) {
 		return;
 	}
 
@@ -1320,8 +1369,13 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 			break;
 		default: EXIT("unknown index_type_and_size: %u\n", args.index_type_and_size);
 	}
-	index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
-	const bool primitive_restart = ResolvePrimitiveRestart(buffer, index_source);
+	index_source.size =
+	    gpu_indirect ? args.indirect_index_size
+	                 : static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
+	EXIT_NOT_IMPLEMENTED(gpu_indirect && index_source.guest_element_size == 1);
+	const bool primitive_restart =
+	    gpu_indirect ? ResolvePrimitiveRestartIndirect(buffer, index_source)
+	                 : ResolvePrimitiveRestart(buffer, index_source);
 
 	std::vector<uint16_t> expanded_indices;
 	if (index_source.guest_element_size == 1) {
@@ -1335,8 +1389,10 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		index_source.size      = expanded_indices.size() * sizeof(uint16_t);
 	}
 
-	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
-	                        args.instance_count, args.first_instance};
+	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex,
+	                        gpu_indirect ? 0u : args.index_count,
+	                        gpu_indirect ? 0u : args.instance_count,
+	                        gpu_indirect ? 0u : args.first_instance};
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
@@ -1356,6 +1412,14 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	DrawEmitInfo emit {};
 	emit.vertex_offset  = vertex_offset + args.base_vertex;
 	emit.first_instance = instance_offset;
+	if (gpu_indirect) {
+		// The args live in guest memory; bind them through the buffer cache (for GPU reads) and
+		// let vkCmdDrawIndexedIndirect consume them, so no CPU read / queue wait is needed.
+		auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
+		    args.indirect_args_addr, sizeof(vk::DrawIndexedIndirectCommand), false);
+		emit.indirect_args_buffer = args_buffer->Handle();
+		emit.indirect_args_offset = args_offset;
+	}
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);
@@ -1367,7 +1431,9 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(buffer.IsInvalid());
-	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
+	const bool gpu_indirect = args.indirect_args_addr != 0;
+	EXIT_IF(!gpu_indirect && args.offset_source == DrawOffsetSource::DrawState &&
+	        args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
@@ -1377,7 +1443,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                    args.first_instance);
 
 	Common::LockGuard lock(m_context.GetMutex());
-	if (args.vertex_count == 0 || args.instance_count == 0) {
+	if (!gpu_indirect && (args.vertex_count == 0 || args.instance_count == 0)) {
 		return;
 	}
 
@@ -1408,7 +1474,9 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	hw_check(buffer);
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto,
-	                         args.vertex_count, args.instance_count, args.first_instance};
+	                         gpu_indirect ? 0u : args.vertex_count,
+	                         gpu_indirect ? 0u : args.instance_count,
+	                         gpu_indirect ? 0u : args.first_instance};
 
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
@@ -1446,6 +1514,14 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	DrawEmitInfo emit {};
 	emit.first_vertex = static_cast<uint32_t>(vertex_offset + static_cast<int32_t>(args.first_vertex));
 	emit.first_instance = instance_offset;
+	if (gpu_indirect) {
+		// The args live in guest memory; bind them through the buffer cache (for GPU reads) and
+		// let vkCmdDrawIndirect consume them, so no CPU read / queue wait is needed.
+		auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
+		    args.indirect_args_addr, sizeof(vk::DrawIndirectCommand), false);
+		emit.indirect_args_buffer = args_buffer->Handle();
+		emit.indirect_args_offset = args_offset;
+	}
 
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);

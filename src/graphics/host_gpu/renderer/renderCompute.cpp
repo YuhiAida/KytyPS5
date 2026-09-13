@@ -204,8 +204,10 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
-                                    uint32_t thread_group_z, uint32_t mode) {
+                                    uint32_t thread_group_z, uint32_t mode,
+                                    uint64_t indirect_args_addr) {
 	EXIT_IF(buffer.IsInvalid());
+	const bool gpu_indirect = indirect_args_addr != 0;
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
@@ -249,6 +251,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	ShaderComputeInputInfo input_info {};
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+	EXIT_NOT_IMPLEMENTED(gpu_indirect && use_thread_dimensions);
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
@@ -260,11 +263,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = input_info.stage.resources;
-	if (TryConsumeComputeMetaClear(input_info, buffer)) {
+	if (!gpu_indirect && TryConsumeComputeMetaClear(input_info, buffer)) {
 		ResetBindings();
 		return;
 	}
-	if (TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
+	if (!gpu_indirect &&
+	    TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
 	                                thread_group_z, mode)) {
 		ResetBindings();
 		return;
@@ -355,7 +359,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
-	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
+	if (!gpu_indirect && (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0)) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
 			LOGF("GraphicsRenderDispatchDirect: skipping zero-sized dispatch groups=%ux%ux%u "
@@ -396,7 +400,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	if (gpu_indirect) {
+		// The args live in guest memory; bind them through the buffer cache (for GPU reads) and
+		// let vkCmdDispatchIndirect consume them, so no CPU read / queue wait is needed.
+		auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
+		    indirect_args_addr, sizeof(vk::DispatchIndirectCommand), false);
+		vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	} else {
+		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);

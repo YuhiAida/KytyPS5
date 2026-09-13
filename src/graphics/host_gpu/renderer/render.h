@@ -61,6 +61,10 @@ struct DrawIndexArgs {
 	int32_t          base_vertex                = 0;
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
+	// GPU-side indirect draw: guest address of the native indirect args (0 = args were parsed
+	// on the CPU) and an upper bound in bytes for the index range the GPU may read.
+	uint64_t         indirect_args_addr         = 0;
+	uint64_t         indirect_index_size        = 0;
 	uint32_t         render_target_slice_offset = 0;
 };
 
@@ -70,6 +74,9 @@ struct DrawAutoArgs {
 	uint32_t         first_vertex               = 0;
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
+	// GPU-side indirect draw: guest address of the native args (0 = args were parsed on the
+	// CPU).
+	uint64_t         indirect_args_addr         = 0;
 	uint32_t         render_target_slice_offset = 0;
 };
 
@@ -155,7 +162,8 @@ public:
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
-	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
+	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+	                    uint64_t indirect_args_addr = 0);
 
 	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
 	void                           FindBuffers(PreparedBindings& bindings);

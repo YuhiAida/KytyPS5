@@ -1091,6 +1091,39 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
+	// GPU-side path: never read the args on the CPU (that read page-faults into
+	// BufferCache::ReadMemory and waits for the GPU when the args page is GPU-dirty). The raw
+	// args go to vkCmdDrawIndirect / vkCmdDrawIndexedIndirect instead. Fall back to the CPU
+	// path when the setup does not fit (8-bit indices, unknown INDEX_BUFFER_SIZE, debug dumps).
+	if (!indexed && !GraphicsRunDebugDumpEnabled()) {
+		// The instance count cannot be read without the CPU read this path removes; the
+		// hardware NUM_INSTANCES register keeps the common single-instance value.
+		m_num_instances = 1;
+		DrawIndexAuto({.vertex_count       = 0,
+		               .instance_count     = 0,
+		               .first_vertex       = 0,
+		               .first_instance     = 0,
+		               .offset_source      = DrawOffsetSource::IndirectArgs,
+		               .indirect_args_addr = m_draw_indirect_args_base_addr + data_offset});
+		return;
+	}
+	if (indexed && (m_index_type_and_size == 0u || m_index_type_and_size == 1u) &&
+	    m_index_buffer_size != 0u && !GraphicsRunDebugDumpEnabled()) {
+		// The instance count cannot be read without the CPU read this path removes; the
+		// hardware NUM_INSTANCES register keeps the common single-instance value.
+		m_num_instances = 1;
+		DrawIndex({.index_count         = 0,
+		           .index_addr          = reinterpret_cast<const void*>(m_index_base_addr),
+		           .instance_count      = 0,
+		           .base_vertex         = 0,
+		           .first_instance      = 0,
+		           .offset_source       = DrawOffsetSource::IndirectArgs,
+		           .indirect_args_addr  = m_draw_indirect_args_base_addr + data_offset,
+		           .indirect_index_size = static_cast<uint64_t>(m_index_buffer_size) *
+		                                  (m_index_type_and_size == 0u ? 2u : 4u)});
+		return;
+	}
+
 	const auto* args_addr =
 	    reinterpret_cast<const void*>(m_draw_indirect_args_base_addr + data_offset);
 
@@ -1258,7 +1291,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 }
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
-                                      uint32_t thread_group_z, uint32_t mode) {
+                                      uint32_t thread_group_z, uint32_t mode,
+                                      uint64_t indirect_args_addr) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 
 	uint32_t frame_num = 0;
@@ -1303,7 +1337,8 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		}
 
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
-		                                              thread_group_y, thread_group_z, mode);
+		                                              thread_group_y, thread_group_z, mode,
+		                                              indirect_args_addr);
 	}
 
 	/*constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;
@@ -1339,8 +1374,17 @@ void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(m_dispatch_indirect_args_base_addr == 0);
 
 	const auto args_addr = m_dispatch_indirect_args_base_addr + data_offset;
-	auto*      args      = reinterpret_cast<const DispatchIndirectArgs*>(args_addr);
 
+	// GPU-side path: the args go to vkCmdDispatchIndirect; the CPU read that page-faults into
+	// BufferCache::ReadMemory and waits for the GPU is skipped. Thread-dimension remapping
+	// needs the counts, so that mode keeps the CPU path.
+	constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;
+	if ((mode & DispatchInitiatorUseThreadDimensions) == 0 && !GraphicsRunDebugDumpEnabled()) {
+		DispatchDirect(0, 0, 0, mode, args_addr);
+		return;
+	}
+
+	auto* args = reinterpret_cast<const DispatchIndirectArgs*>(args_addr);
 	DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode);
 }
 
