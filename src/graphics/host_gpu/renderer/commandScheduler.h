@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 
@@ -40,6 +41,21 @@ public:
 	void                      WaitPriorityOperations(uint64_t tick);
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+	// Opt-in GPU-side attribution (KYTY_GPU_TIME_LOG=1): timestamp queries around every compute
+	// dispatch and every submission batch, read back without stalling the queue, to separate
+	// dispatch execution from serialization inside a batch and idle gaps between submits.
+	struct GpuDispatchMeta {
+		uint64_t shader_hash = 0;
+		uint32_t group_x     = 0;
+		uint32_t group_y     = 0;
+		uint32_t group_z     = 0;
+		uint32_t mode        = 0;
+		uint32_t indirect    = 0;
+	};
+	[[nodiscard]] bool GpuTimeActive() const noexcept { return m_gpu_time.pool != nullptr; }
+	void GpuTimeDispatchBegin(const CommandBuffer& buffer, const GpuDispatchMeta& meta);
+	void GpuTimeDispatchMid(const CommandBuffer& buffer);
+	void GpuTimeDispatchEnd(const CommandBuffer& buffer);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
@@ -80,9 +96,33 @@ private:
 		uint64_t                     tick = 0;
 	};
 
+	struct GpuTimeState {
+		vk::QueryPool                pool            = nullptr;
+		uint32_t                     capacity        = 0;
+		uint32_t                     cursor          = 0;
+		double                       period_ns       = 0.0;
+		uint32_t                     batch_first     = 0;
+		bool                         batch_span_open = false;
+		bool                         batch_truncated = false;
+		bool                         dispatch_open   = false;
+		uint32_t                     dispatch_slot   = 0;
+		std::vector<GpuDispatchMeta> batch_meta;
+	};
+
+	struct GpuTimeBatch {
+		uint32_t                     first = 0;
+		uint32_t                     slots = 0;
+		uint64_t                     tick  = 0;
+		std::vector<GpuDispatchMeta> meta;
+	};
+
 	void BeginNext();
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
+	void GpuTimeInitialize();
+	void GpuTimeBeginBatch();
+	void GpuTimeDrainReadbacks();
+	void GpuTimeReadBatch(GpuTimeBatch batch);
 
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;
@@ -97,6 +137,8 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	GpuTimeState                 m_gpu_time;
+	std::vector<GpuTimeBatch>    m_gpu_time_batches;
 };
 
 } // namespace Libs::Graphics

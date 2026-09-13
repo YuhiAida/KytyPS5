@@ -621,7 +621,9 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	result.program = std::move(ir);
 	if (options.dump_ir) {
 		result.decoded_dump = std::move(decoded_dump);
-		result.cfg_dump     = CFG::GraphToString(cfg);
+	}
+	if (options.dump_ir || options.dump_cfg) {
+		result.cfg_dump = CFG::GraphToString(cfg);
 	}
 	return result;
 }
@@ -662,6 +664,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		result.decoded_dump = std::move(translated.decoded_dump);
 		result.ir_dump      = std::move(ir_dump);
 	}
+	result.cfg_dump = std::move(translated.cfg_dump);
 	return result;
 }
 

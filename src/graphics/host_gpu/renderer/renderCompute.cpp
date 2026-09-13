@@ -396,6 +396,18 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const auto compute_t4 = std::chrono::steady_clock::now();
+	auto&      gpu_time_scheduler = m_context.GetCommandScheduler();
+	const bool gpu_time_active    = gpu_time_scheduler.GpuTimeActive();
+	if (gpu_time_active) {
+		CommandScheduler::GpuDispatchMeta gpu_time_meta {};
+		gpu_time_meta.shader_hash = program.shader_hash;
+		gpu_time_meta.group_x     = thread_group_x;
+		gpu_time_meta.group_y     = thread_group_y;
+		gpu_time_meta.group_z     = thread_group_z;
+		gpu_time_meta.mode        = mode;
+		gpu_time_meta.indirect    = gpu_indirect ? 1u : 0u;
+		gpu_time_scheduler.GpuTimeDispatchBegin(buffer, gpu_time_meta);
+	}
 	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
 	has_storage_writes =
 	    std::any_of(program.info.images.begin(), program.info.images.end(),
@@ -419,6 +431,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	} else {
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	}
+	if (gpu_time_active) {
+		gpu_time_scheduler.GpuTimeDispatchMid(buffer);
 	}
 	if (compute_timing) {
 		// Opt-in per-phase breakdown (KYTY_COMPUTE_LOG=1) of where a compute dispatch's CPU time
@@ -463,6 +478,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (gpu_time_active) {
+		gpu_time_scheduler.GpuTimeDispatchEnd(buffer);
+	}
 	ResetBindings();
 }
 

@@ -18,6 +18,7 @@ struct CompileOptions {
 	uint64_t                    shader_hash     = 0;
 	bool                        dump_ir                    = true;
 	bool                        early_dump                 = false;
+	bool                        dump_cfg                   = false;
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
@@ -34,6 +35,7 @@ struct CompileResult {
 	std::vector<uint32_t>  spirv;
 	std::string            decoded_dump;
 	std::string            ir_dump;
+	std::string            cfg_dump;
 	IR::Program            program;
 };
 

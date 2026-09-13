@@ -181,6 +181,27 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 	}
 }
 
+// KYTY_CFG_DUMP=1: write the structurizer's CFG text for shaders that fell back to the
+// dispatcher emitter. Used to classify externally-entered selection regions before changing
+// the structurizer (see memory/2026-09-13-spongebob-playability.md).
+void DumpShaderCfg(const char* stage_name, uint64_t shader_hash, const std::string& cfg) {
+	if (std::getenv("KYTY_CFG_DUMP") == nullptr || cfg.empty()) {
+		return;
+	}
+	static std::atomic_int id = 0;
+	const auto path = Config::GetShaderLogFolder() / fmt::format("{:04d}_shader_{}_{:016x}.cfg.txt",
+	                                                             id++, stage_name, shader_hash);
+	Common::File::CreateDirectories(path.parent_path());
+	Common::File file(path);
+	if (file.IsInvalid()) {
+		const auto path_text = Common::PathToString(path);
+		LOGF_COLOR(Log::Color::BrightRed, "Can't create file: %s\n", path_text.c_str());
+		return;
+	}
+	file.Write(cfg.data(), cfg.size());
+	LOGF("CfgDump: %s hash=0x%016" PRIx64 " bytes=%zu\n", stage_name, shader_hash, cfg.size());
+}
+
 bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
                          const std::vector<uint32_t>& spirv) {
 	if (!Config::ShaderValidationEnabled()) {
@@ -310,6 +331,9 @@ struct PipelineCache::ProgramCache {
 			     options.shader_hash);
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+		if (result.program.dispatcher_fallback) {
+			DumpShaderCfg(stage_name, options.shader_hash, result.cfg_dump);
+		}
 		MaybeOptimizeShaderSpirv(options.shader_hash, result.spirv);
 
 		vk::ShaderModuleCreateInfo create_info {};
@@ -451,6 +475,7 @@ struct PipelineCache::ProgramCache {
 		options.back_code      = params.back_code;
 		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		options.early_dump  = options.dump_ir;
+		options.dump_cfg    = std::getenv("KYTY_CFG_DUMP") != nullptr;
 		options.dump_label  = label;
 		options.input_info  = stage_input;
 

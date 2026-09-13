@@ -587,6 +587,26 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	AddLayoutBindings(descriptor_bindings, *input_info.stage.program,
 	                  vk::ShaderStageFlagBits::eCompute);
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
+	if (std::getenv("KYTY_PIPE_LAYOUT_LOG") != nullptr) {
+		static std::atomic<uint32_t> layout_log_count {0};
+		if (layout_log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+			std::string bindings;
+			for (const auto& binding: descriptor_bindings) {
+				bindings += " ";
+				bindings += std::to_string(binding.binding);
+				bindings += ":";
+				bindings += vk::to_string(binding.descriptorType);
+				bindings += "x";
+				bindings += std::to_string(binding.descriptorCount);
+			}
+			LOGF("PipeLayout: CS wave=%u subgroup_control=%d required=%u bindings=%s pc=%u\n",
+			     wave_size, graphics.compute_subgroup_size_control_enabled ? 1 : 0,
+			     comp_shader_stage_info.pNext != nullptr ? comp_subgroup_size.requiredSubgroupSize
+			                                             : 0u,
+			     bindings.c_str(),
+			     static_cast<uint32_t>(ShaderRecompiler::IR::NativePushConstantSize));
+		}
+	}
 	const vk::PushConstantRange push_constants {vk::ShaderStageFlagBits::eCompute, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 
