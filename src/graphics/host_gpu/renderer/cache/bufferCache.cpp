@@ -32,25 +32,38 @@ constexpr uint64_t GdsBufferSize = 64 * 1024;
 // Opt-in readback profile (KYTY_READBACK_LOG=1): GPU-dirty downloads and the wall time spent
 // waiting for the GPU queue inside them. KYTY_SKIP_READBACK=1 (diagnostic only) skips the
 // wait, leaving the guest copy possibly stale; used to measure the CPU-side ceiling.
-void RecordReadbackWait(double wait_ms, uint64_t vaddr, uint64_t size) {
+void RecordReadbackWait(double wait_ms, uint64_t vaddr, uint64_t size, bool cpu_write,
+                        uint64_t request_size) {
 	static const bool enabled = std::getenv("KYTY_READBACK_LOG") != nullptr;
 	if (!enabled) {
 		return;
 	}
 	static auto     window_start = std::chrono::steady_clock::now();
 	static uint64_t count        = 0;
+	static uint64_t read_count   = 0;
+	static uint64_t write_count  = 0;
 	static double   total_ms     = 0.0;
 	static double   max_ms       = 0.0;
+	static uint64_t bulk_writes  = 0;
+	static uint64_t small_writes = 0;
 	static std::map<std::pair<uint64_t, uint64_t>, uint64_t> hot;
 	count++;
+	(cpu_write ? write_count : read_count)++;
+	if (cpu_write) {
+		(request_size > 64 ? bulk_writes : small_writes)++;
+	}
 	total_ms = total_ms + wait_ms;
 	max_ms   = std::max(max_ms, wait_ms);
 	hot[{vaddr, size}]++;
 	const auto now     = std::chrono::steady_clock::now();
 	const auto elapsed = std::chrono::duration<double>(now - window_start).count();
 	if (elapsed >= 1.0) {
-		LOGF("Readback: count=%llu wait=%.0f ms/s max=%.0f ms\n",
-		     static_cast<unsigned long long>(count), total_ms, max_ms);
+		LOGF("Readback: count=%llu read=%llu cpu-write=%llu (bulk=%llu small=%llu) wait=%.0f"
+		     " ms/s max=%.0f ms\n",
+		     static_cast<unsigned long long>(count), static_cast<unsigned long long>(read_count),
+		     static_cast<unsigned long long>(write_count),
+		     static_cast<unsigned long long>(bulk_writes),
+		     static_cast<unsigned long long>(small_writes), total_ms, max_ms);
 		std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> top;
 		top.reserve(hot.size());
 		for (const auto& [range, calls]: hot) {
@@ -65,6 +78,10 @@ void RecordReadbackWait(double wait_ms, uint64_t vaddr, uint64_t size) {
 		}
 		window_start = now;
 		count        = 0;
+		read_count   = 0;
+		write_count  = 0;
+		bulk_writes  = 0;
+		small_writes = 0;
 		total_ms     = 0.0;
 		max_ms       = 0.0;
 		hot.clear();
@@ -310,7 +327,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
 			                                              wait_begin)
 			        .count(),
-			    window_begin, window_end - window_begin);
+			    window_begin, window_end - window_begin, is_write, size);
 			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
 		}
 		if (is_write) {
