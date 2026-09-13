@@ -253,8 +253,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	EXIT_NOT_IMPLEMENTED(gpu_indirect && use_thread_dimensions);
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
+	const bool compute_timing = std::getenv("KYTY_COMPUTE_LOG") != nullptr;
+	const auto compute_t0     = std::chrono::steady_clock::now();
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	const auto compute_t1 = std::chrono::steady_clock::now();
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -371,8 +374,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	buffer.EndRendering();
+	const auto compute_t2 = std::chrono::steady_clock::now();
 	auto& pipeline =
 	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	const auto compute_t3 = std::chrono::steady_clock::now();
 	auto bindings = PrepareBindings(input_info.stage);
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
@@ -385,6 +390,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
+	const auto compute_t4 = std::chrono::steady_clock::now();
 	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
 	has_storage_writes =
 	    std::any_of(program.info.images.begin(), program.info.images.end(),
@@ -408,6 +414,36 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	} else {
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	}
+	if (compute_timing) {
+		// Opt-in per-phase breakdown (KYTY_COMPUTE_LOG=1) of where a compute dispatch's CPU time
+		// goes: program lookup/compile, pipeline lookup/creation, bindings, command emission.
+		const auto compute_t5 = std::chrono::steady_clock::now();
+		static std::atomic<uint64_t> t_program {0};
+		static std::atomic<uint64_t> t_pipeline {0};
+		static std::atomic<uint64_t> t_bindings {0};
+		static std::atomic<uint64_t> t_dispatch {0};
+		static std::atomic<uint64_t> t_count {0};
+		static auto                  last = std::chrono::steady_clock::now();
+		const auto ns = [](auto a, auto b) {
+			return static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+		};
+		t_program.fetch_add(ns(compute_t0, compute_t1));
+		t_pipeline.fetch_add(ns(compute_t2, compute_t3));
+		t_bindings.fetch_add(ns(compute_t3, compute_t4));
+		t_dispatch.fetch_add(ns(compute_t4, compute_t5));
+		t_count.fetch_add(1);
+		const auto now = std::chrono::steady_clock::now();
+		if (now - last >= std::chrono::seconds(1)) {
+			LOGF("Compute: n=%llu program=%.0f pipeline=%.0f bindings=%.0f dispatch=%.0f ms/s\n",
+			     static_cast<unsigned long long>(t_count.exchange(0)),
+			     static_cast<double>(t_program.exchange(0)) / 1.0e6,
+			     static_cast<double>(t_pipeline.exchange(0)) / 1.0e6,
+			     static_cast<double>(t_bindings.exchange(0)) / 1.0e6,
+			     static_cast<double>(t_dispatch.exchange(0)) / 1.0e6);
+			last = now;
+		}
 	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
