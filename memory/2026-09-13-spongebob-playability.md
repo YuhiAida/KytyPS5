@@ -675,3 +675,21 @@ Phase attribution if needed first: `LogDrawPhase` (debug.cpp:618, gated by
   is what is missing. Retry with Vulkan validation enabled before re-landing.
 - Kept from the attempt: WantedRenderScale now requires a blittable single-sample colour
   format and keeps depth, compressed, multisampled and video-out surfaces native (v2 policy).
+
+## Iteration 45 - resampling retried: the blit hung on an out-of-bounds rectangle
+- The hang was not a barrier/lifetime issue: `ScaledBlitRegion` gave the two sides of the
+  blit backwards at both call sites, so an upload recorded source 1920x1080 (the host region)
+  on the 3840x2160 staging and destination 3840x2160 (the guest region) on the 1920x1080
+  backing. A destination region larger than the image is an out-of-bounds blit: undefined
+  behaviour, and the GPU timeline stalls (`MasterSemaphore ... waiting tick=N current=N-1
+  who=finish`), which in turn deadlocks the threads that call UnmapMemory/SendCommandSync.
+- Proof: `KYTY_RENDER_SCALE_LOG` blit line printed the swapped regions; a temporary
+  `KYTY_RENDER_SCALE_NO_BLIT=1` gate kept the staging copy and dropped the blit, and the same
+  run presented 48-52 dumps instead of 1.
+- Fix (e6adccc): the helper takes explicit source side, clamps both rectangles to their
+  extents (the scale factor can round one texel past the larger side) and drops empty regions;
+  both call sites corrected. Verified at scale 0.5: 52 dumps in 110 s and a correct title
+  screen; the blit now reads `3840x2160[0,0 3840x2160] -> 1920x1080[0,0 1920x1080]`.
+- Steady-state A/B (180 s runs, last 12 s): ~8.4 fps at scale 1.0 vs ~11.1 fps at scale 0.5
+  (+30 %) at the same ~63 % GPU load. The scene is hitch-bound (recurring 100-350 ms maxgaps,
+  shaders still compiling), so the scale stays opt-in; correctness first by default.
