@@ -2190,6 +2190,179 @@ bool StructurizeImpl(Graph& graph) {
 	return true;
 }
 
+// Cross-entry tail duplication (recovered from the earlier "overlapping early-exit ladders"
+// work): when a selection region is entered from outside, the header cannot own its blocks. Clone
+// the region members the header does not dominate, redirect the header-owned edges into the
+// clones, and join every header-owned exit through a private synthetic merge; the external copy
+// keeps the original blocks. Applied one region per call as a last resort after selection
+// routing, and only when loop bodies stay whole inside or outside the clone set.
+bool DuplicateOneExternalSelectionRegion(Graph& graph, uint32_t block_budget) {
+	std::vector<uint32_t> loop_headers;
+	loop_headers.reserve(graph.natural_loops.size());
+	for (const auto& loop: graph.natural_loops) {
+		AddUnique(loop_headers, loop.header);
+	}
+
+	std::vector<uint32_t> selection_headers;
+	for (const auto& block: graph.blocks) {
+		if (block.terminator.kind == TerminatorKind::ConditionalBranch &&
+		    !Contains(loop_headers, block.id)) {
+			selection_headers.push_back(block.id);
+		}
+	}
+	std::sort(selection_headers.begin(), selection_headers.end(), [&](uint32_t lhs, uint32_t rhs) {
+		const auto* lhs_block = graph.FindBlock(lhs);
+		const auto* rhs_block = graph.FindBlock(rhs);
+		const auto  lhs_depth = lhs_block != nullptr ? lhs_block->dominators.size() : 0u;
+		const auto  rhs_depth = rhs_block != nullptr ? rhs_block->dominators.size() : 0u;
+		return lhs_depth != rhs_depth ? lhs_depth > rhs_depth : lhs < rhs;
+	});
+
+	for (const auto block_id: selection_headers) {
+		const auto* block = graph.FindBlock(block_id);
+		if (block == nullptr || IsInnermostLoopControlConditional(graph, *block)) {
+			continue;
+		}
+		const auto merge = FindSelectionMerge(graph, *block);
+		if (merge == UINT32_MAX || graph.FindBlock(merge) == nullptr) {
+			continue;
+		}
+		const auto region = SelectionRegion(graph, *block, merge);
+		bool       has_external = false;
+		for (auto member: region) {
+			const auto* member_block = graph.FindBlock(member);
+			if (member_block == nullptr) {
+				continue;
+			}
+			for (auto predecessor: member_block->predecessors) {
+				if (predecessor != block_id && !Contains(region, predecessor)) {
+					has_external = true;
+					break;
+				}
+			}
+			if (has_external) {
+				break;
+			}
+		}
+		if (!has_external) {
+			continue;
+		}
+
+		std::vector<uint32_t> cloned_blocks;
+		for (auto member: region) {
+			if (!graph.Dominates(block_id, member)) {
+				cloned_blocks.push_back(member);
+			}
+		}
+		if (cloned_blocks.empty() || Contains(cloned_blocks, graph.entry_block) ||
+		    graph.blocks.size() + cloned_blocks.size() + 1u > block_budget) {
+			continue;
+		}
+		bool loop_closed = true;
+		for (const auto& edge: graph.back_edges) {
+			if (Contains(cloned_blocks, edge.from) != Contains(cloned_blocks, edge.to)) {
+				loop_closed = false;
+				break;
+			}
+		}
+		if (!loop_closed) {
+			continue;
+		}
+
+		const auto                   first_clone = static_cast<uint32_t>(graph.blocks.size());
+		std::map<uint32_t, uint32_t> clones;
+		for (uint32_t i = 0; i < cloned_blocks.size(); i++) {
+			clones.emplace(cloned_blocks[i], first_clone + i);
+		}
+		for (auto clone_source: cloned_blocks) {
+			BasicBlock clone    = *graph.FindBlock(clone_source);
+			clone.id            = clones.at(clone_source);
+			clone.predecessors.clear();
+			clone.dominators.clear();
+			clone.post_dominators.clear();
+			graph.blocks.push_back(std::move(clone));
+		}
+
+		const auto remap_block = [&](BasicBlock& target_block) {
+			const auto remap_target = [&](uint32_t& target) {
+				if (const auto it = clones.find(target); it != clones.end()) {
+					target = it->second;
+				}
+			};
+			for (auto& successor: target_block.successors) {
+				remap_target(successor);
+			}
+			remap_target(target_block.terminator.true_block);
+			remap_target(target_block.terminator.false_block);
+			remap_target(target_block.terminator.merge_block);
+			remap_target(target_block.terminator.continue_block);
+			for (auto& target: target_block.terminator.indirect_targets) {
+				remap_target(target);
+			}
+			for (auto& target: target_block.terminator.indirect_selector_targets) {
+				remap_target(target);
+			}
+		};
+		for (auto member: region) {
+			const auto owned = clones.contains(member) ? clones.at(member) : member;
+			if (auto* owned_block = graph.FindBlock(owned); owned_block != nullptr) {
+				remap_block(*owned_block);
+			}
+		}
+
+		const auto private_merge = AppendSyntheticBranchBlock(graph, merge);
+		auto&      header        = *graph.FindBlock(block_id);
+		remap_block(header);
+
+		for (auto member: region) {
+			const auto owned = clones.contains(member) ? clones.at(member) : member;
+			if (auto* owned_block = graph.FindBlock(owned); owned_block != nullptr) {
+				ReplaceValue(owned_block->successors, merge, private_merge);
+				ReplaceTerminatorTarget(owned_block->terminator, merge, private_merge);
+			}
+		}
+		ReplaceValue(header.successors, merge, private_merge);
+		ReplaceTerminatorTarget(header.terminator, merge, private_merge);
+
+		// Keep source order stable: the clones move directly before the merge block.
+		{
+			std::vector<BasicBlock> old_blocks = std::move(graph.blocks);
+			std::vector<BasicBlock> new_blocks;
+			new_blocks.reserve(old_blocks.size());
+			for (uint32_t i = 0; i < old_blocks.size(); i++) {
+				if (i == merge) {
+					for (auto clone_source: cloned_blocks) {
+						new_blocks.push_back(std::move(old_blocks[clones.at(clone_source)]));
+					}
+				}
+				if (clones.contains(i)) {
+					continue;
+				}
+				new_blocks.push_back(std::move(old_blocks[i]));
+			}
+			const auto id_map = ApplyBlockOrder(graph, std::move(new_blocks));
+			for (auto& [source, clone]: clones) {
+				(void)source;
+				clone = RemapId(clone, id_map);
+			}
+			RebuildPredecessors(graph);
+			RecomputeAnalyses(graph);
+
+			// Never hand back a worse graph than the dispatcher fallback: every clone must now be
+			// owned by the header. On violation the caller keeps the previous failure diagnostics.
+			const auto header_new = RemapId(block_id, id_map);
+			for (const auto& [source, clone]: clones) {
+				(void)source;
+				if (!graph.Dominates(header_new, clone)) {
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+	return false;
+}
+
 } // namespace
 
 bool Structurize(Graph& graph) {
@@ -2216,6 +2389,21 @@ bool Structurize(Graph& graph) {
 	// rewrite unrelated selections that were already structurally valid.
 	for (uint32_t route_variable = 0; route_variable < route_budget; route_variable++) {
 		if (!RouteSharedSelectionArm(routed, route_variable)) {
+			break;
+		}
+		structured = routed;
+		if (StructurizeImpl(structured)) {
+			graph = std::move(structured);
+			return true;
+		}
+	}
+	// Routing cannot express a selection region that is entered from outside; revisit those with
+	// bounded cross-entry duplication, one region per attempt, from the untouched graph.
+	routed                     = graph;
+	const auto duplicate_budget = std::max<uint32_t>(
+	    32u, std::min<uint32_t>(1024u, static_cast<uint32_t>(graph.blocks.size()) * 8u));
+	for (uint32_t attempt = 0; attempt < 8u; attempt++) {
+		if (!DuplicateOneExternalSelectionRegion(routed, duplicate_budget)) {
 			break;
 		}
 		structured = routed;
