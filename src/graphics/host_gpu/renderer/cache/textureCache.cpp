@@ -186,6 +186,34 @@ struct UploadAddressCounter {
 };
 static std::mutex                                         g_upload_mutex;
 static std::unordered_map<uint64_t, UploadAddressCounter> g_upload_by_address;
+static std::atomic<uint64_t>                               g_upload_cpu_ns {0};
+static std::mutex                                          g_upload_hash_mutex;
+static std::unordered_map<uint64_t, uint64_t>              g_upload_last_hash;
+static std::atomic<uint64_t>                               g_upload_same {0};
+static std::atomic<uint64_t>                               g_upload_diff {0};
+
+void UploadCpuTime(uint64_t nanoseconds) {
+	g_upload_cpu_ns.fetch_add(nanoseconds);
+}
+
+// Samples the first 4 KiB of the uploaded guest data: equal hashes for consecutive uploads of
+// the same address mean the re-upload carried unchanged content.
+void UploadContent(uint64_t address, const uint8_t* data, uint64_t size) {
+	uint64_t       hash = 1469598103934665603ull;
+	const uint64_t n    = std::min<uint64_t>(size, 4096);
+	for (uint64_t i = 0; i < n; i++) {
+		hash ^= data[i];
+		hash *= 1099511628211ull;
+	}
+	std::scoped_lock lock {g_upload_hash_mutex};
+	auto&            last = g_upload_last_hash[address];
+	if (last == hash && last != 0) {
+		g_upload_same.fetch_add(1);
+	} else {
+		g_upload_diff.fetch_add(1);
+		last = hash;
+	}
+}
 
 void Upload(uint64_t address, uint64_t bytes) {
 	g_upload_calls.fetch_add(1);
@@ -221,6 +249,12 @@ void ReportIfEnabled() {
 	     static_cast<unsigned long long>(upload_calls),
 	     static_cast<double>(download_bytes) / elapsed / 1048576.0,
 	     static_cast<unsigned long long>(download_calls));
+	{
+		const auto cpu_ms = static_cast<double>(g_upload_cpu_ns.exchange(0)) / 1.0e6;
+		LOGF("Xfer: uploadCpu=%.0f ms/s frame_same=%llu frame_new=%llu\n", cpu_ms,
+		     static_cast<unsigned long long>(g_upload_same.exchange(0)),
+		     static_cast<unsigned long long>(g_upload_diff.exchange(0)));
+	}
 	{
 		std::scoped_lock lock {g_upload_mutex};
 		std::vector<std::pair<uint64_t, UploadAddressCounter>> top {g_upload_by_address.begin(),
@@ -1305,7 +1339,18 @@ void TextureCache::InitializeImage(ImageId id) {
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
+		const auto upload_start = std::chrono::steady_clock::now();
 		UploadImage(image, *source, source_offset);
+		ExternalTransferCounters::UploadCpuTime(
+		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                          std::chrono::steady_clock::now() - upload_start)
+		                          .count()));
+		if (const auto mapped = source->Mapped();
+		    !mapped.empty() && source->IsInBounds(source_offset, image.info.data.size)) {
+			ExternalTransferCounters::UploadContent(image.info.data.address,
+			                                        mapped.data() + source_offset,
+			                                        image.info.data.size);
+		}
 		image.ClearBufferModified();
 	}
 	if (image.IsCpuDirty()) {
