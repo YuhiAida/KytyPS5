@@ -400,3 +400,21 @@ Phase attribution if needed first: `LogDrawPhase` (debug.cpp:618, gated by
 - 814ea3d compute phase timing; ffbb70d shader compile addr->hash map; 47b11c7 present-tick /
   vtrig / compute ablation diagnostics.
 
+## Iteration 23 - slow-phase resource profile (pivotal)
+- CPU sampling during slow phase (fps 1.7-3.3): 0.17-0.94 cores total. Busiest thread ~99%
+  (single guest thread), second is the NVIDIA driver thread [vkrt] up to 84%; everything else
+  idle. GPU ~40-44% (harness). => the slow phase is NOT CPU- or GPU-bound: it is
+  latency/serialization bound.
+- x64 SIGILL trap rate (gdb catchpoint, SIGSEGV/BUS passed through): 1479 traps / ~115 s ~ 13/s.
+  The illegal-instruction fallback is NOT the bottleneck. Same 1.3-1.4 fps under gdb as native.
+- Frame times quantize in ~100 ms units (short slow ~333 ms ~ 3x100; stalls 666-866 ms ~ 7-9x100),
+  matching the repeated "Equeue wait timedout: SonyIOManager (timo = 100000)" retry loop seen
+  1500-2400x per run.
+- Hypothesis (strong): the guest load/menu logic polls the guest-created "SonyIOManager" e-queue
+  for an event our emulation never triggers; progress advances only in 100 ms timeouts => 1-4 fps
+  and 40-90 s loads / apparent freezes. The compute storm is downstream of this pacing, not the
+  cause.
+- Next: log the guest-requested filter/ident when those waits time out (extend the timeout log),
+  identify the missing event, find the emulator side that should trigger it (user-event or device
+  ioctl path), implement, and verify fps + menu-load time.
+
