@@ -3,6 +3,7 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <iterator>
 #include <map>
@@ -645,6 +646,11 @@ void RemapIds(std::vector<uint32_t>& values, const std::vector<uint32_t>& id_map
 void RebuildPredecessors(Graph& graph) {
 	for (auto& block: graph.blocks) {
 		block.predecessors.clear();
+		// A remap that could not resolve a block leaves UINT32_MAX behind. Such an edge has no
+		// target any more; drop it here so post-dominator analysis cannot index out of bounds.
+		std::erase_if(block.successors, [&](uint32_t successor) {
+			return successor >= graph.blocks.size();
+		});
 		SortUnique(block.successors);
 	}
 	for (const auto& block: graph.blocks) {
@@ -2324,19 +2330,22 @@ bool DuplicateOneExternalSelectionRegion(Graph& graph, uint32_t block_budget) {
 		ReplaceValue(header.successors, merge, private_merge);
 		ReplaceTerminatorTarget(header.terminator, merge, private_merge);
 
-		// Keep source order stable: the clones move directly before the merge block.
+		// Keep source order stable: the appended clones move directly before the merge block and
+		// the originals stay in place, because entries the header does not dominate still target
+		// them. Dropping an original would leave dangling successor ids behind.
 		{
 			std::vector<BasicBlock> old_blocks = std::move(graph.blocks);
 			std::vector<BasicBlock> new_blocks;
 			new_blocks.reserve(old_blocks.size());
+			const auto clone_slot_end = first_clone + static_cast<uint32_t>(cloned_blocks.size());
 			for (uint32_t i = 0; i < old_blocks.size(); i++) {
+				if (i >= first_clone && i < clone_slot_end) {
+					continue;
+				}
 				if (i == merge) {
 					for (auto clone_source: cloned_blocks) {
 						new_blocks.push_back(std::move(old_blocks[clones.at(clone_source)]));
 					}
-				}
-				if (clones.contains(i)) {
-					continue;
 				}
 				new_blocks.push_back(std::move(old_blocks[i]));
 			}
@@ -2402,7 +2411,10 @@ bool Structurize(Graph& graph) {
 	routed                     = graph;
 	const auto duplicate_budget = std::max<uint32_t>(
 	    32u, std::min<uint32_t>(1024u, static_cast<uint32_t>(graph.blocks.size()) * 8u));
-	for (uint32_t attempt = 0; attempt < 8u; attempt++) {
+	// Temporary A/B knob: KYTY_CFG_NO_DUP=1 keeps the dispatcher fallback for every region that
+	// would need cross-entry duplication.
+	const bool duplication_enabled = std::getenv("KYTY_CFG_NO_DUP") == nullptr;
+	for (uint32_t attempt = 0; duplication_enabled && attempt < 8u; attempt++) {
 		if (!DuplicateOneExternalSelectionRegion(routed, duplicate_budget)) {
 			break;
 		}

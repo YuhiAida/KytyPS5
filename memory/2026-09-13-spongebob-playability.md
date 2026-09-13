@@ -619,3 +619,45 @@ Phase attribution if needed first: `LogDrawPhase` (debug.cpp:618, gated by
 - Frozen evidence: `_Build/linux/B0_struct.txt` (pre-crash), 
   `_Build/linux/_Shaders/0000_shader_cs_1929ac47f3eaefa0.cfg.txt`, `/tmp/gdb_out6.txt` (backtrace).
 
+
+## Iteration 40 - the "DMA fill" crash was the structurizer, not memory
+- The `access=1 address=0x0` crash decodes (code bytes at pc) to
+  `mov rbx,[rcx+rax+0x60]` inside `ComputePostDominators` -> `graph.blocks[successors[i]]`
+  with a successor id of 0xFFFFFFFF: post-dominator analysis indexed out of bounds.
+- Source: `RebuildPredecessors` filters invalid ids for `predecessors` only, and
+  `ApplyBlockOrder`/`RemapId` turn a lost block into UINT32_MAX, so the garbage survives in
+  `successors`. Root cause: the ported duplication reorder dropped the ORIGINAL clone-source
+  blocks (`if (clones.contains(i)) continue;` - verified against the parked original cb6ead5,
+  which used `MoveBlockBefore` and never dropped a block); external predecessors then
+  referenced dropped ids.
+- Fixes: keep the originals (only the appended clone slots move), and make
+  `RebuildPredecessors` drop unresolvable successor ids. Add `KYTY_CFG_NO_DUP=1` as an A/B knob.
+- Verified: the same 180 s run no longer aborts, reaches VS 201 / PS 304 / CS 240 (was
+  VS 89 / PS 105 / CS 167).
+
+## Iteration 41 - second crash: GC download bigger than the ring
+- Next blocker: `BufferCache: download of 219941376 bytes (vaddr=0x...3076fa0000
+  size=293273600, copies=92) exceeds 128 MiB download staging buffer capacity`.
+- The GC drained whole cached buffers; the 512 KiB window used by the CPU-read path is the
+  existing pattern, so `RunGarbageCollector` now windows at half the download ring.
+- Verified: clean 180 s run (rc=124 = timeout, no EXIT), `fallback_memory` unchanged.
+
+## Iteration 42 - render scale default made opt-in (visual regression)
+- User-visible regression: menu/title background missing, content in a top-left third.
+  `KYTY_RENDER_SCALE_LOG` shows `guest=3840x2160 host=1280x720`, `upload copy exceeds scaled
+  backing ... clamping`, `native surface bound (wanted=0.333)`: the window-size default in
+  `WantedRenderScale` (from an earlier exp-commit a7d5ea5) scales the 4K targets to 720p while
+  transfers still clamp, so the frame is cropped. Not caused by the structurizer work.
+- Fix: default stays 1.0; `KYTY_RENDER_SCALE=<0..1>` remains the opt-in. v2 design requirement
+  stands: scaled transfers must resample before the window-size default returns.
+- Verified: 1280x720 window now renders the full background again (title + menu captures).
+
+## Iteration 43 - menu-phase profile: 100 GPU drains/s
+- Menu is ~8-10 fps at 1280x720 with correct visuals. `wait_flip_done` (nop.r06) is ~0 ms in
+  this phase; PM4 handlers sum to ~150 ms/s; GPU util ~69%.
+- `KYTY_READBACK_LOG` (now also prints the hot ranges) shows ~100-134 synchronous downloads/s,
+  150-190 ms/s of waiting, 10-47 ms each, spread over distinct 16-64 KiB windows.
+- Diagnostic `KYTY_SKIP_READBACK=1` (stale data, expected to break correctness) jumps to
+  27-57 fps before the guest crashes on stale values: the guest's reads of GPU-written memory
+  are forcing full GPU drains (serialisation). Next lever: make GPU writes CPU-visible without
+  a drain (eager write-back / GPU-side indirection), not more raster scaling.

@@ -1520,10 +1520,37 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
+	// Opt-in split of the WAIT_FLIP_DONE cost (KYTY_OPCODE_LOG=1): the flush submits the
+	// pending command stream, the wait blocks until the queued flip for this buffer is done.
+	static const bool profiled = std::getenv("KYTY_OPCODE_LOG") != nullptr;
+	const auto        start    = std::chrono::steady_clock::now();
+
 	BufferFlush();
+
+	const auto flush_done = std::chrono::steady_clock::now();
 
 	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
 	                                      static_cast<int>(display_buffer_index));
+
+	if (!profiled) {
+		return;
+	}
+	const auto   waited = std::chrono::steady_clock::now();
+	static double acc_flush_ms = 0.0;
+	static double acc_wait_ms  = 0.0;
+	static uint64_t acc_calls   = 0;
+	static auto     window      = std::chrono::steady_clock::now();
+	acc_flush_ms += std::chrono::duration<double, std::milli>(flush_done - start).count();
+	acc_wait_ms += std::chrono::duration<double, std::milli>(waited - flush_done).count();
+	acc_calls++;
+	if (std::chrono::duration<double>(waited - window).count() >= 1.0) {
+		LOGF("WaitFlipDone: calls=%llu flush=%.0fms wait=%.0fms\n",
+		     static_cast<unsigned long long>(acc_calls), acc_flush_ms, acc_wait_ms);
+		acc_flush_ms = 0.0;
+		acc_wait_ms  = 0.0;
+		acc_calls    = 0;
+		window       = waited;
+	}
 }
 
 template <typename T>

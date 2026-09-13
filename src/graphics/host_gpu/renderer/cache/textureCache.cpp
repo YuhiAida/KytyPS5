@@ -434,15 +434,9 @@ float WantedRenderScale(TextureCache::BindingType type, const ImageInfo& info) {
 		const float parsed = std::strtof(env, nullptr);
 		return (parsed > 0.0f && parsed < 1.0f) ? parsed : 1.0f;
 	}
-	const auto window_width  = Config::GetScreenWidth();
-	const auto window_height = Config::GetScreenHeight();
-	if (window_width == 0 || window_height == 0) {
-		return 1.0f;
-	}
-	return std::min(1.0f, std::min(static_cast<float>(window_width) /
-	                                  static_cast<float>(info.extent.width),
-	                              static_cast<float>(window_height) /
-	                                  static_cast<float>(info.extent.height)));
+	// The window-size default stays opt-in until scaled transfers resample instead of clamping:
+	// a scaled backing whose guest-extent transfers are cropped renders invalid content.
+	return 1.0f;
 }
 
 } // namespace

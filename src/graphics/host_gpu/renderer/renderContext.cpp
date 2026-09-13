@@ -66,6 +66,15 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
 	if (!IsMapped(fault_vaddr, fault_size)) {
+		if (std::getenv("KYTY_MEM_LOG") != nullptr) {
+			static std::atomic<uint32_t> reject_log_count {0};
+			if (reject_log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+				LOGF("MemFault: reject access=%u addr=0x%016" PRIx64 " near2m=%d near64k=%d\n",
+				     static_cast<unsigned>(access), fault_vaddr,
+				     IsMapped(fault_vaddr & ~uint64_t {0x1fffff}, fault_size) ? 1 : 0,
+				     IsMapped(fault_vaddr & ~uint64_t {0xffff}, fault_size) ? 1 : 0);
+			}
+		}
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
