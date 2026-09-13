@@ -1295,6 +1295,33 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
                                       uint64_t indirect_args_addr) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 
+	// Opt-in dispatch workload stats (KYTY_DISPATCH_LOG=1): dispatches per second and their
+	// total group count - distinguishes compute-heavy frames from raster-heavy ones.
+	{
+		static const bool           enabled = std::getenv("KYTY_DISPATCH_LOG") != nullptr;
+		static std::atomic<uint64_t> count {0};
+		static std::atomic<uint64_t> groups {0};
+		static std::atomic<uint64_t> max_groups {0};
+		if (enabled) {
+			count.fetch_add(1);
+			const auto total = static_cast<uint64_t>(std::max(thread_group_x, 1u)) *
+			                   std::max(thread_group_y, 1u) * std::max(thread_group_z, 1u);
+			groups.fetch_add(total);
+			uint64_t prev = max_groups.load();
+			while (total > prev && !max_groups.compare_exchange_weak(prev, total)) {
+			}
+			static auto last = std::chrono::steady_clock::now();
+			const auto  now  = std::chrono::steady_clock::now();
+			if (now - last >= std::chrono::seconds(1)) {
+				LOGF("Dispatch: count=%llu groups=%llu max=%llu\n",
+				     static_cast<unsigned long long>(count.exchange(0)),
+				     static_cast<unsigned long long>(groups.exchange(0)),
+				     static_cast<unsigned long long>(max_groups.exchange(0)));
+				last = now;
+			}
+		}
+	}
+
 	uint32_t frame_num = 0;
 	// uint32_t local_x   = 1;
 	// uint32_t local_y   = 1;
