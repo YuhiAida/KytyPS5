@@ -89,6 +89,12 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 }
 
 void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
+	// Diagnostic (KYTY_NO_SHADER_BARRIERS=1): drop the global barriers to measure their cost.
+	// Not a correctness path - only for A/B profiling runs.
+	static const bool disabled = std::getenv("KYTY_NO_SHADER_BARRIERS") != nullptr;
+	if (disabled) {
+		return;
+	}
 	EXIT_IF(vk_buffer == nullptr || !source_stages);
 	const auto barrier = MakeShaderAccessDependency();
 	vk_buffer.pipelineBarrier(source_stages, vk::PipelineStageFlagBits::eAllCommands,
@@ -97,6 +103,11 @@ void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags sou
 
 void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
                               vk::PipelineStageFlags destination_stages) {
+	// Diagnostic (KYTY_NO_SHADER_BARRIERS=1): see ShaderAccessBarrier.
+	static const bool disabled = std::getenv("KYTY_NO_SHADER_BARRIERS") != nullptr;
+	if (disabled) {
+		return;
+	}
 	EXIT_IF(vk_buffer == nullptr || !destination_stages);
 	const auto barrier = MakeShaderWriteHazardDependency();
 	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, destination_stages,
@@ -104,6 +115,11 @@ void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
 }
 
 void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
+	// Diagnostic (KYTY_NO_SHADER_BARRIERS=1): see ShaderAccessBarrier.
+	static const bool disabled = std::getenv("KYTY_NO_SHADER_BARRIERS") != nullptr;
+	if (disabled) {
+		return;
+	}
 	EXIT_IF(vk_buffer == nullptr || !source_stages);
 	const auto barrier = MakeShaderWriteDependency();
 	vk_buffer.pipelineBarrier(source_stages,

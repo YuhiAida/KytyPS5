@@ -1295,13 +1295,16 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
                                       uint64_t indirect_args_addr) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 
-	// Opt-in dispatch workload stats (KYTY_DISPATCH_LOG=1): dispatches per second and their
-	// total group count - distinguishes compute-heavy frames from raster-heavy ones.
+	// Opt-in dispatch workload stats (KYTY_DISPATCH_LOG=1): dispatches per second, their total
+	// group count, the largest single dispatch and the most frequent compute shaders -
+	// distinguishes a heavy pipeline from a re-dispatch loop on one shader.
 	{
-		static const bool           enabled = std::getenv("KYTY_DISPATCH_LOG") != nullptr;
+		static const bool enabled = std::getenv("KYTY_DISPATCH_LOG") != nullptr;
 		static std::atomic<uint64_t> count {0};
 		static std::atomic<uint64_t> groups {0};
 		static std::atomic<uint64_t> max_groups {0};
+		static uint64_t              top_addr[64] {};
+		static uint64_t              top_count[64] {};
 		if (enabled) {
 			count.fetch_add(1);
 			const auto total = static_cast<uint64_t>(std::max(thread_group_x, 1u)) *
@@ -1310,6 +1313,21 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			uint64_t prev = max_groups.load();
 			while (total > prev && !max_groups.compare_exchange_weak(prev, total)) {
 			}
+			const uint64_t addr  = m_sh_ctx.GetCs().cs_regs.data_addr;
+			bool           found = false;
+			for (uint32_t i = 0; i < 64 && !found; i++) {
+				if (top_addr[i] == addr) {
+					top_count[i]++;
+					found = true;
+				}
+			}
+			for (uint32_t i = 0; i < 64 && !found; i++) {
+				if (top_addr[i] == 0) {
+					top_addr[i]  = addr;
+					top_count[i] = 1;
+					found        = true;
+				}
+			}
 			static auto last = std::chrono::steady_clock::now();
 			const auto  now  = std::chrono::steady_clock::now();
 			if (now - last >= std::chrono::seconds(1)) {
@@ -1317,6 +1335,26 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 				     static_cast<unsigned long long>(count.exchange(0)),
 				     static_cast<unsigned long long>(groups.exchange(0)),
 				     static_cast<unsigned long long>(max_groups.exchange(0)));
+				for (uint32_t rank = 0; rank < 3; rank++) {
+					uint32_t best = 64;
+					for (uint32_t i = 0; i < 64; i++) {
+						if (top_count[i] != 0 &&
+						    (best == 64 || top_count[i] > top_count[best])) {
+							best = i;
+						}
+					}
+					if (best == 64) {
+						break;
+					}
+					LOGF("Dispatch:   shader=0x%016" PRIx64 " calls=%llu\n", top_addr[best],
+					     static_cast<unsigned long long>(top_count[best]));
+					top_addr[best]  = 0;
+					top_count[best] = 0;
+				}
+				for (uint32_t i = 0; i < 64; i++) {
+					top_addr[i]  = 0;
+					top_count[i] = 0;
+				}
 				last = now;
 			}
 		}
