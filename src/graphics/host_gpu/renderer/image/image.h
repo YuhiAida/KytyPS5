@@ -47,7 +47,10 @@ struct ImageBinding {
 
 class Image final {
 public:
-	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);
+	// host_scale_x/y scale the host backing extent relative to the guest extent (render scale).
+	// Guest metadata (address layout, pitch, tiling) stays untouched.
+	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info,
+	      float host_scale_x = 1.0f, float host_scale_y = 1.0f);
 	~Image();
 	KYTY_CLASS_NO_COPY(Image);
 
@@ -140,6 +143,8 @@ public:
 
 	ImageInfo        info;
 	VulkanImage      backing;
+	float            host_scale_x = 1.0f;
+	float            host_scale_y = 1.0f;
 	std::vector<CachedImageView> views;
 	ImageUsage       usage;
 	ImageBinding     binding;

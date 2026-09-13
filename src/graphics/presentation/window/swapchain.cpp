@@ -14,6 +14,7 @@
 #include "graphics/presentation/window/windowInternal.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -324,6 +325,9 @@ struct Presenter::Impl {
 		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
 		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
 		frames.SetFormat(swapchain.Format());
+		if (std::getenv("KYTY_TRACE_LOG") != nullptr) {
+			LOGF("Recovering Vulkan swapchain: done\n");
+		}
 	}
 
 	Image& ResolveSurface(const ImageInfo& info) {
@@ -493,7 +497,13 @@ void Swapchain::Destroy() {
 
 	{
 		Common::LockGuard queue_lock(graphics.queue_mutex);
+		if (std::getenv("KYTY_TRACE_LOG") != nullptr) {
+			LOGF("Swapchain: destroy waitIdle begin\n");
+		}
 		RequireVulkanSuccess(graphics.queue.waitIdle(), "wait for swapchain queue");
+		if (std::getenv("KYTY_TRACE_LOG") != nullptr) {
+			LOGF("Swapchain: destroy waitIdle end\n");
+		}
 	}
 	if (m_system_overlay != nullptr) {
 		m_system_overlay->ReleaseVulkan();
@@ -547,11 +557,18 @@ void Swapchain::Recreate(bool surface_lost) {
 Swapchain::Status Swapchain::AcquireNextImage() {
 	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
 	m_image_index     = static_cast<uint32_t>(-1);
+	if (std::getenv("KYTY_TRACE_LOG") != nullptr) {
+		LOGF("Swapchain: acquire frame=%u\n", m_frame_index);
+	}
 	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
 	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
 	    &m_image_index);
 	switch (result) {
-		case vk::Result::eSuccess: break;
+		case vk::Result::eSuccess:
+			if (std::getenv("KYTY_TRACE_LOG") != nullptr) {
+				LOGF("Swapchain: acquire ok image=%u\n", m_image_index);
+			}
+			break;
 		case vk::Result::eSuboptimalKHR:
 			LOGF("vkAcquireNextImageKHR returned vk::Result::eSuboptimalKHR\n");
 			return Status::Recreate;
@@ -663,7 +680,13 @@ uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
 	SubmitInfo submit;
 	submit.AddWait(m_image_acquired[m_frame_index], 1, vk::PipelineStageFlagBits::eTransfer);
 	submit.AddSignal(m_render_complete[m_image_index]);
-	return scheduler.Submit(submit);
+	const auto tick = scheduler.Submit(submit);
+	if (std::getenv("KYTY_TRACE_LOG") != nullptr) {
+		LOGF("Swapchain: submit tick=%llu frame=%u image=%u sched=%p\n",
+		     static_cast<unsigned long long>(tick), m_frame_index, m_image_index,
+		     static_cast<const void*>(&scheduler));
+	}
+	return tick;
 }
 
 Swapchain::Status Swapchain::Present() {
@@ -683,7 +706,11 @@ Swapchain::Status Swapchain::Present() {
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
 	}
 	switch (result) {
-		case vk::Result::eSuccess: break;
+		case vk::Result::eSuccess:
+			if (std::getenv("KYTY_TRACE_LOG") != nullptr) {
+				LOGF("Swapchain: present ok image=%u\n", m_image_index);
+			}
+			break;
 		case vk::Result::eSuboptimalKHR:
 			LOGF("vkQueuePresentKHR returned vk::Result::eSuboptimalKHR\n");
 			return Status::Recreate;

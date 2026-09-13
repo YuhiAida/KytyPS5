@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -125,7 +126,7 @@ void CommandScheduler::Shutdown() {
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	m_master.Wait(CurrentTick() - 1);
+	m_master.Wait(CurrentTick() - 1, "shutdown");
 	PopPendingOperations();
 	DrainPriorityOperations();
 	m_priority_thread.request_stop();
@@ -177,7 +178,7 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 
 void CommandScheduler::FlushAndWait() {
 	const auto tick = Submit();
-	m_master.Wait(tick);
+	m_master.Wait(tick, "flush-wait");
 	BeginNext();
 }
 
@@ -186,7 +187,7 @@ void CommandScheduler::Finish() {
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	m_master.Wait(CurrentTick() - 1);
+	m_master.Wait(CurrentTick() - 1, "finish");
 	BeginNext();
 	PopPendingOperations();
 }
@@ -200,10 +201,10 @@ void CommandScheduler::Wait(uint64_t tick) {
 		// resources are released only at the next GPU operation boundary.
 		const auto submitted_tick = Submit();
 		EXIT_IF(submitted_tick != tick);
-		m_master.Wait(tick);
+		m_master.Wait(tick, "wait-current");
 		BeginNext();
 	} else {
-		m_master.Wait(tick);
+		m_master.Wait(tick, "wait");
 	}
 }
 
@@ -281,7 +282,7 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			m_priority_active      = true;
 			m_priority_active_tick = operation.tick;
 		}
-		m_master.Wait(operation.tick);
+		m_master.Wait(operation.tick, "priority");
 		if (!stop.stop_requested()) {
 			RunOperation(std::move(operation.callback));
 		}
@@ -386,6 +387,22 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		                  m_command.m_debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+
+	static uint32_t trace_count = 0;
+	if (std::getenv("KYTY_TRACE_LOG") != nullptr && trace_count++ < 512) {
+		LOGF("Sched[%p]: submit tick=%llu waits=%u signals=%u", static_cast<const void*>(this),
+		     static_cast<unsigned long long>(tick), submit.num_wait_semaphores,
+		     submit.num_signal_semaphores);
+		for (uint32_t index = 0; index < submit.num_wait_semaphores; index++) {
+			LOGF(" w[%u]=%p/%llu", index, static_cast<const void*>(submit.wait_semaphores[index]),
+			     static_cast<unsigned long long>(submit.wait_ticks[index]));
+		}
+		for (uint32_t index = 0; index < submit.num_signal_semaphores; index++) {
+			LOGF(" s[%u]=%p/%llu", index, static_cast<const void*>(submit.signal_semaphores[index]),
+			     static_cast<unsigned long long>(submit.signal_ticks[index]));
+		}
+		LOGF("\n");
+	}
 
 	m_command.m_buffer = nullptr;
 	return tick;

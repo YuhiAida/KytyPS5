@@ -316,14 +316,37 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	const auto& ctx = buffer.GetRegisters();
 
 	const auto&  vp = ctx.GetScreenViewport();
-	vk::Extent2D framebuffer_extent {};
+	// Guest-space extent of the primary render target, plus the host (possibly render-scaled)
+	// extent used for the Vulkan render area. Guest viewport/scissor registers are authored in
+	// guest pixels and are scaled by the host:guest ratio of the bound surface.
+	vk::Extent2D guest_extent {};
+	ImageId      primary_image {};
 	if (color_count > 0 && colors[0].image_id) {
-		framebuffer_extent = colors[0].Extent();
+		primary_image = colors[0].image_id;
+		guest_extent  = colors[0].Extent();
 	} else if (depth.image_id) {
-		framebuffer_extent = {depth.desc.info.extent.width, depth.desc.info.extent.height};
+		primary_image = depth.image_id;
+		guest_extent  = {depth.desc.info.extent.width, depth.desc.info.extent.height};
+	}
+	vk::Extent2D framebuffer_extent = guest_extent;
+	float        scale_x            = 1.0f;
+	float        scale_y            = 1.0f;
+	if (primary_image) {
+		const auto& image = buffer.GetContext().GetTextureCache().GetImage(primary_image);
+		const auto  mip   = (color_count > 0 && colors[0].image_id)
+		                        ? colors[0].guest_mip_level
+		                        : depth.desc.view_info.base_level;
+		const auto guest_width  = std::max(1u, image.info.extent.width >> mip);
+		const auto guest_height = std::max(1u, image.info.extent.height >> mip);
+		const auto host_width   = std::max(1u, image.backing.extent.width >> mip);
+		const auto host_height  = std::max(1u, image.backing.extent.height >> mip);
+		scale_x = static_cast<float>(host_width) / static_cast<float>(guest_width);
+		scale_y = static_cast<float>(host_height) / static_cast<float>(guest_height);
+		framebuffer_extent = {host_width, host_height};
 	} else {
 		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
 		framebuffer_extent = {limits.maxFramebufferWidth, limits.maxFramebufferHeight};
+		guest_extent       = framebuffer_extent;
 	}
 
 	const auto& outputs = vs_input_info.stage.program->info.outputs;
@@ -343,21 +366,42 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 			viewport.width  = static_cast<float>(std::min(limits.maxViewportDimensions[0], 16384u));
 			viewport.height = static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u));
 		} else {
-			viewport.x      = guest.xoffset - guest.xscale;
-			viewport.y      = guest.yoffset - guest.yscale;
-			viewport.width  = guest.xscale * 2.0f;
-			viewport.height = guest.yscale * 2.0f;
+			viewport.x      = (guest.xoffset - guest.xscale) * scale_x;
+			viewport.y      = (guest.yoffset - guest.yscale) * scale_y;
+			viewport.width  = guest.xscale * 2.0f * scale_x;
+			viewport.height = guest.yscale * 2.0f * scale_y;
 		}
 		viewport.minDepth =
 		    guest.zoffset - (ctx.GetClipControl().dx_clip_space ? 0.0f : guest.zscale);
 		viewport.maxDepth = guest.zscale + guest.zoffset;
 
 		const auto final_scissor =
-		    calc_final_scissor(vp, ctx.GetScanModeControl(), framebuffer_extent, i);
+		    calc_final_scissor(vp, ctx.GetScanModeControl(), guest_extent, i);
+		// Scale the guest-pixel scissor into host pixels and clamp to the render area.
+		ScissorRect host_scissor = final_scissor;
+		if (scale_x != 1.0f || scale_y != 1.0f) {
+			host_scissor.left =
+			    static_cast<int>(std::floor(static_cast<double>(final_scissor.left) * scale_x));
+			host_scissor.top =
+			    static_cast<int>(std::floor(static_cast<double>(final_scissor.top) * scale_y));
+			host_scissor.right =
+			    static_cast<int>(std::ceil(static_cast<double>(final_scissor.right) * scale_x));
+			host_scissor.bottom =
+			    static_cast<int>(std::ceil(static_cast<double>(final_scissor.bottom) * scale_y));
+			host_scissor.left =
+			    std::clamp(host_scissor.left, 0, static_cast<int>(framebuffer_extent.width));
+			host_scissor.top =
+			    std::clamp(host_scissor.top, 0, static_cast<int>(framebuffer_extent.height));
+			host_scissor.right =
+			    std::clamp(host_scissor.right, 0, static_cast<int>(framebuffer_extent.width));
+			host_scissor.bottom =
+			    std::clamp(host_scissor.bottom, 0, static_cast<int>(framebuffer_extent.height));
+		}
 		auto& scissor  = scissors[i];
-		scissor.offset = {final_scissor.left, final_scissor.top};
-		scissor.extent = {static_cast<uint32_t>(final_scissor.right - final_scissor.left),
-		                  static_cast<uint32_t>(final_scissor.bottom - final_scissor.top)};
+		scissor.offset = {host_scissor.left, host_scissor.top};
+		scissor.extent = {
+		    static_cast<uint32_t>(std::max(0, host_scissor.right - host_scissor.left)),
+		    static_cast<uint32_t>(std::max(0, host_scissor.bottom - host_scissor.top))};
 		if (viewport.width == 0.0f) {
 			// Keep empty slots at their guest index; Vulkan requires a positive viewport width.
 			viewport.width = 1.0f;
@@ -519,9 +563,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
 		              buffer.Handle());
-		const auto extent       = target.Extent();
-		state.width             = std::min(state.width, extent.width);
-		state.height            = std::min(state.height, extent.height);
+		// The Vulkan render area follows the host image extent (render scale shrinks it).
+		const auto host_extent  = vk::Extent2D {
+		    std::max(1u, image.backing.extent.width >> target.guest_mip_level),
+		    std::max(1u, image.backing.extent.height >> target.guest_mip_level)};
+		state.width             = std::min(state.width, host_extent.width);
+		state.height            = std::min(state.height, host_extent.height);
 		state.num_layers        = std::min(state.num_layers, view.layer_count);
 		auto& attachment        = state.color_attachments[i];
 		attachment.image_view   = image_view;
@@ -594,8 +641,10 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
 		              buffer.Handle());
-		state.width               = std::min(state.width, depth.desc.info.extent.width);
-		state.height              = std::min(state.height, depth.desc.info.extent.height);
+		state.width               = std::min(state.width, std::max(1u, image.backing.extent.width >>
+		                                                        depth.desc.view_info.base_level));
+		state.height              = std::min(state.height, std::max(1u, image.backing.extent.height >>
+		                                                         depth.desc.view_info.base_level));
 		state.num_layers          = std::min(state.num_layers, view.layer_count);
 		const auto aspects        = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 		auto&      attachment     = state.depth_stencil_attachment;

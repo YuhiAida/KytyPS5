@@ -7,6 +7,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace Libs::Graphics {
 
@@ -107,8 +108,16 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	const auto unmap = [this, vaddr, size] {
 		if (m_command_scheduler.Active()) {
 			const auto tick = m_command_scheduler.CurrentTick();
+			static uint32_t trace_count = 0;
+			if (std::getenv("KYTY_TRACE_LOG") != nullptr && trace_count++ < 16) {
+				LOGF("Unmap: addr=0x%016" PRIx64 " size=0x%016" PRIx64 " tick=%llu\n", vaddr,
+				     size, static_cast<unsigned long long>(tick));
+			}
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
+			if (std::getenv("KYTY_TRACE_LOG") != nullptr && trace_count <= 16) {
+				LOGF("Unmap: finish done addr=0x%016" PRIx64 "\n", vaddr);
+			}
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);

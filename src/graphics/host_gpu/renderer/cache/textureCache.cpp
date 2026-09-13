@@ -24,6 +24,7 @@
 #include <cstring>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <limits>
 #include <mutex>
 #include <span>
@@ -300,8 +301,60 @@ bool TextureCache::SafeToDownload(const Image& image) {
 	return !m_buffer_cache.HasGpuDirtyBytes(range.address, range.size);
 }
 
-ImageId TextureCache::InsertImage(const ImageInfo& info) {
-	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+namespace {
+
+// Render scale: host backing images of render targets and depth targets are scaled so the
+// guest renders at the emulator window resolution. Guest image metadata (layout, pitch,
+// tiling) stays untouched; only the host extent shrinks. Returns 1.0 when no scaling applies.
+//
+// Video-out surfaces are deliberately not scaled: their content is moved between guest RAM and
+// the host image with plain buffer/image copies (guest extents), which cannot rescale, and a
+// scaled backing would make those copies exceed the host extent (GPU hang). The presenter blits
+// the guest-sized video-out surface into the swapchain, which already downscales it.
+float WantedRenderScale(TextureCache::BindingType type, const ImageInfo& info) {
+	// Diagnostic escape hatch: scale every binding (textures included) to measure how much of
+	// the frame is texture bandwidth vs render-target work. Not a correctness path.
+	const bool scale_all = std::getenv("KYTY_RENDER_SCALE_ALL") != nullptr;
+	if (!scale_all && type != TextureCache::BindingType::RenderTarget &&
+	    type != TextureCache::BindingType::DepthTarget) {
+		return 1.0f;
+	}
+	if (info.extent.width == 0 || info.extent.height == 0) {
+		return 1.0f;
+	}
+	if (const char* env = std::getenv("KYTY_RENDER_SCALE")) {
+		const float parsed = std::strtof(env, nullptr);
+		return (parsed > 0.0f && parsed < 1.0f) ? parsed : 1.0f;
+	}
+	const auto window_width  = Config::GetScreenWidth();
+	const auto window_height = Config::GetScreenHeight();
+	if (window_width == 0 || window_height == 0) {
+		return 1.0f;
+	}
+	return std::min(1.0f, std::min(static_cast<float>(window_width) /
+	                                  static_cast<float>(info.extent.width),
+	                              static_cast<float>(window_height) /
+	                                  static_cast<float>(info.extent.height)));
+}
+
+} // namespace
+
+ImageId TextureCache::InsertImage(const ImageInfo& info, float host_scale_x, float host_scale_y) {
+	if (host_scale_x != 1.0f || host_scale_y != 1.0f) {
+		static std::atomic<uint32_t> log_count {0};
+		if (std::getenv("KYTY_RENDER_SCALE_LOG") != nullptr &&
+		    log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+			LOGF("RenderScale: guest=%ux%u host=%ux%u addr=0x%016" PRIx64 " size=0x%016" PRIx64
+			     "\n",
+			     info.extent.width, info.extent.height,
+			     static_cast<uint32_t>(std::lround(
+			         static_cast<double>(info.extent.width) * host_scale_x)),
+			     static_cast<uint32_t>(std::lround(
+			         static_cast<double>(info.extent.height) * host_scale_y)),
+			     info.data.address, info.data.size);
+		}
+	}
+	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info, host_scale_x, host_scale_y);
 	if (!info.data.Empty()) {
 		RegisterImage(id);
 	}
@@ -1337,14 +1390,27 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		if (!result) {
-			result         = InsertImage(desc.info);
-			auto& inserted = m_slot_images[result];
+			const float scale = WantedRenderScale(desc.type, desc.info);
+			result            = InsertImage(desc.info, scale, scale);
+			auto& inserted    = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {
 				inserted.MarkBufferModified();
 			}
 		}
 		auto& image = m_slot_images[result];
+		if (image.host_scale_x == 1.0f) {
+			// A surface first materialised through a non-scalable binding keeps its native size.
+			const float wanted_scale = WantedRenderScale(desc.type, desc.info);
+			static std::atomic<uint32_t> log_count {0};
+			if (wanted_scale < 1.0f && std::getenv("KYTY_RENDER_SCALE_LOG") != nullptr &&
+			    log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+				LOGF("RenderScale: native surface bound (type=%u guest=%ux%u wanted=%.3f "
+				     "addr=0x%016" PRIx64 ")\n",
+				     static_cast<uint32_t>(desc.type), desc.info.extent.width,
+				     desc.info.extent.height, wanted_scale, desc.info.data.address);
+			}
+		}
 		if (desc.type == BindingType::VideoOut &&
 		    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
 			const bool guest_dirty = image.IsBufferModified() || image.IsCpuDirty();
@@ -1627,9 +1693,11 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id,
 		attachment.storeOp     = vk::AttachmentStoreOp::eStore;
 		attachment.clearValue  = clear;
 		vk::RenderingInfo rendering {};
+		// Render scale: the render area must stay inside the host backing, which can be smaller
+		// than the guest extent for scaled render targets.
 		rendering.renderArea.extent = {
-		    std::max(image.info.extent.width >> range.baseMipLevel, 1u),
-		    std::max(image.info.extent.height >> range.baseMipLevel, 1u)};
+		    std::max(image.backing.extent.width >> range.baseMipLevel, 1u),
+		    std::max(image.backing.extent.height >> range.baseMipLevel, 1u)};
 		rendering.layerCount           = range.layerCount;
 		rendering.colorAttachmentCount = 1;
 		rendering.pColorAttachments    = &attachment;

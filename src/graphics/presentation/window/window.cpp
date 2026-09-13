@@ -1022,6 +1022,22 @@ void WindowContext::UpdateTitle() {
 	    device_name, processor_name, frame_num, current_fps);
 
 	RunOnMainThread([this, text = std::move(text)] { SDL_SetWindowTitle(window, text.c_str()); });
+
+	// Diagnostics: report the window rectangle so an external screenshot harness can crop the
+	// game window out of a full-screen capture (Wayland compositors do not allow capturing a
+	// background window directly).
+	static const bool log_geometry = std::getenv("KYTY_WINDOW_GEOM_LOG") != nullptr;
+	static uint32_t   geometry_log_count = 0;
+	if (log_geometry && geometry_log_count < 8) {
+		int x = 0;
+		int y = 0;
+		int w = 0;
+		int h = 0;
+		SDL_GetWindowPosition(window, &x, &y);
+		SDL_GetWindowSize(window, &w, &h);
+		LOGF("WindowGeom: x=%d y=%d w=%d h=%d\n", x, y, w, h);
+		geometry_log_count++;
+	}
 }
 
 } // namespace Libs::Graphics

@@ -569,18 +569,32 @@ static void LogSubmissionTime(double ms);
 
 // Opt-in PM4 profile (KYTY_OPCODE_LOG=1): command volume per second plus the five most
 // expensive packet handlers, so a translation-bound frame can be attributed to opcodes.
-static void RecordOpcodeTime(uint32_t opcode, double ms, uint64_t dwords) {
+// Nested packets (inside indirect buffers) are accumulated separately: their time is already
+// contained in the enclosing IT_INDIRECT_BUFFER packet's time.
+static void RecordOpcodeTime(uint32_t opcode, uint32_t sub_code, uint32_t depth, double ms,
+                             uint64_t dwords) {
 	static const bool enabled = std::getenv("KYTY_OPCODE_LOG") != nullptr;
 	if (!enabled) {
 		return;
 	}
 	static double   acc_ms[256] = {};
 	static uint64_t acc_dw[256] = {};
+	static double   nested_ms[256] = {};
+	static double   nop_ms[256] = {};
+	static uint64_t nop_dw[256] = {};
 	static uint64_t window_dw   = 0;
 	static auto     window_start = std::chrono::steady_clock::now();
 	if (opcode < 256) {
-		acc_ms[opcode] += ms;
-		acc_dw[opcode]++;
+		if (depth <= 1) {
+			acc_ms[opcode] += ms;
+			acc_dw[opcode]++;
+		} else {
+			nested_ms[opcode] += ms;
+		}
+		if (opcode == Pm4::IT_NOP && sub_code < 256) {
+			nop_ms[sub_code] += ms;
+			nop_dw[sub_code]++;
+		}
 	}
 	window_dw += dwords;
 	const auto now = std::chrono::steady_clock::now();
@@ -610,10 +624,56 @@ static void RecordOpcodeTime(uint32_t opcode, double ms, uint64_t dwords) {
 			     static_cast<unsigned long long>(acc_dw[best[slot]]));
 		}
 	}
+	// IT_NOP carries custom operations; break them down by their sub-code so the expensive
+	// custom op is identifiable.
+	int nop_best[3] = {-1, -1, -1};
+	for (int i = 0; i < 256; i++) {
+		if (nop_ms[i] <= 0.0) {
+			continue;
+		}
+		for (int slot = 0; slot < 3; slot++) {
+			if (nop_best[slot] < 0 || nop_ms[i] > nop_ms[nop_best[slot]]) {
+				for (int move = 2; move > slot; move--) {
+					nop_best[move] = nop_best[move - 1];
+				}
+				nop_best[slot] = i;
+				break;
+			}
+		}
+	}
+	for (int slot = 0; slot < 3; slot++) {
+		if (nop_best[slot] >= 0) {
+			LOGF(" nop.r%02x=%.0fms(%llu)", nop_best[slot], nop_ms[nop_best[slot]],
+			     static_cast<unsigned long long>(nop_dw[nop_best[slot]]));
+		}
+	}
+	int nested_best[3] = {-1, -1, -1};
+	for (int i = 0; i < 256; i++) {
+		if (nested_ms[i] <= 0.0) {
+			continue;
+		}
+		for (int slot = 0; slot < 3; slot++) {
+			if (nested_best[slot] < 0 || nested_ms[i] > nested_ms[nested_best[slot]]) {
+				for (int move = 2; move > slot; move--) {
+					nested_best[move] = nested_best[move - 1];
+				}
+				nested_best[slot] = i;
+				break;
+			}
+		}
+	}
+	for (int slot = 0; slot < 3; slot++) {
+		if (nested_best[slot] >= 0) {
+			LOGF(" in%02x=%.0fms", nested_best[slot], nested_ms[nested_best[slot]]);
+		}
+	}
 	LOGF("\n");
 	for (int i = 0; i < 256; i++) {
-		acc_ms[i] = 0.0;
-		acc_dw[i] = 0;
+		acc_ms[i]    = 0.0;
+		acc_dw[i]    = 0;
+		nested_ms[i] = 0.0;
+		nop_ms[i]    = 0.0;
+		nop_dw[i]    = 0;
 	}
 	window_dw    = 0;
 	window_start = now;
@@ -621,6 +681,10 @@ static void RecordOpcodeTime(uint32_t opcode, double ms, uint64_t dwords) {
 
 bool GuestGpu::Process(Submission& submission) {
 	const auto process_begin = std::chrono::steady_clock::now();
+	static uint32_t trace_count = 0;
+	if (std::getenv("KYTY_TRACE_LOG") != nullptr && trace_count++ < 64) {
+		LOGF("Gpu: process begin type=%d\n", static_cast<int>(submission.type));
+	}
 	const bool first_slice = !submission.started;	auto& cp = GetProcessor(submission.queue_id);
 
 	if (first_slice && submission.reset_processor) {
@@ -723,6 +787,14 @@ bool GuestGpu::Process(Submission& submission) {
 	const auto total_ms =
 	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - process_begin)
 	        .count();
+	if (std::getenv("KYTY_NO_PM4_DRAIN") != nullptr) {
+		ProcessCommands();
+	}
+	static uint32_t trace_count_end = 0;
+	if (std::getenv("KYTY_TRACE_LOG") != nullptr && trace_count_end++ < 64) {
+		LOGF("Gpu: process end complete=%d type=%d\n", complete ? 1 : 0,
+		     static_cast<int>(submission.type));
+	}
 	LogSubmissionTime(total_ms);
 	if (total_ms >= 100.0) {
 		LOGF("Sub: slow %.0f ms (translate=%.0f gc=%.0f flush=%.0f)\n", total_ms, process_ms, gc_ms,
@@ -807,7 +879,7 @@ void CommandProcessor::SuspendPm4() {
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 	while (execution.m_buffer_stack.size() > stop_depth) {
-		if (g_gpu_state != nullptr) {
+		if (g_gpu_state != nullptr && std::getenv("KYTY_NO_PM4_DRAIN") == nullptr) {
 			g_gpu_state->ProcessCommands();
 		}
 		const auto buffer_index = execution.m_buffer_stack.size() - 1;
@@ -894,11 +966,12 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		const auto packet_begin = std::chrono::steady_clock::now();
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
-		RecordOpcodeTime(
-		    opcode,
-		    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - packet_begin)
-		        .count(),
-		    packet_dw);
+		RecordOpcodeTime(opcode, opcode == Pm4::IT_NOP ? KYTY_PM4_R(packet_header) : 0u,
+		                 static_cast<uint32_t>(execution.m_buffer_stack.size()),
+		                 std::chrono::duration<double, std::milli>(
+		                     std::chrono::steady_clock::now() - packet_begin)
+		                     .count(),
+		                 packet_dw);
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			if (execution.m_buffer_stack.size() > buffer_index + 1) {
