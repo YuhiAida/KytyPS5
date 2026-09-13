@@ -493,3 +493,72 @@ Phase attribution if needed first: `LogDrawPhase` (debug.cpp:618, gated by
   the 4K-grid integer-shader storm; (c) menu-load time should now be measured end-to-end again
   (the gc stalls used to add ~0.6 s per collection during the load).
 
+## Iteration 29 - user-visible freeze isolated: ONE lazy driver compile
+- The user-visible intro→menu freeze = one ~41-43 s stall (`Sub: slow 43203 ms
+  (translate=42173, gc=1030)`; RT-scale run).
+- `PipeCreate` instrumentation (gated KYTY_COMPUTE_LOG): `PipeCreate: n=5 wait=0
+  create=41467 ms/s` + `PipeCreate: driver create 41455 ms` -> the entire stall is ONE
+  `vkCreateComputePipelines` call. Zero mutex wait.
+- Monster module: hash=0x1929ac47f3eaefa0, 1592 guest instructions -> SPIR-V 153,810 words
+  (615 KB) in 8 ms (our emitter is fast). Dump:
+  `_Build/linux/_Shaders/0364_new_shader_cs_1929ac47f3eaefa0.spv`.
+
+## Iteration 30 - driver cache does not persist the monster; size is not the cause
+- Warm run with driver cache loaded (23,966,294 bytes): pipeline still 41,200 ms -> the giant
+  entry never persists (blob sizes fluctuate 22.9-24.7 MB across runs -> likely evicted).
+- Sibling big modules in the same run: 0xbd2e37f57ad2d6c0 (103,416 words) and
+  0x5191f67261c3b7c4 (158,440 words) compile in **600-686 ms** -> module SIZE is not the
+  driver's problem; this one module is qualitatively different.
+
+## Iteration 31 - DISABLE_OPTIMIZATION: no-op (DEAD)
+- `KYTY_FAST_PIPE_COMPILE=1` (vk::eDisableOptimization on compute creates): driver create
+  **42,951 ms** vs raw 41,455 ms. Driver cost is not its optimization stage.
+- 41.5 s is near-constant across raw / disable-opt / spirv-opt variants (41.5 / 43.0 / 41.5 s)
+  -> looks like a FIXED driver fallback/timeout path, not proportional compile time.
+
+## Iteration 32 - spirv-opt: viable tooling, wrong fix (DEAD as fix)
+- Module is valid (`spirv-val` rc=0). Structure: 1,723 function-local vars, 572 phi, 2,383
+  labels; top ops: 5908 Bitcast, 4767 Load, 2843 Select, 2826 Store, 2383 Label, 1723 Variable.
+- `spirv-opt -O`: 615,240 -> **1,740,164 bytes** (Loads 4767->1121, Labels 2383->1806,
+  Stores unchanged 2826). `-Os` ~same.
+- In-engine (`KYTY_OPT_SPV`, threshold 100k words, RegisterPerformancePasses): monster
+  153,810 -> **436,600 words** (+3,450 ms), driver still **41,474 ms**. Siblings 103k->85k /
+  158k->126k (irrelevant, already fast).
+- Conclusion: driver time is independent of module size and of spirv-opt -> construct-specific
+  pathology in THIS module.
+
+## Iteration 33 - standalone probe built (for construct bisection)
+- `_Build/probe_pipebench.cpp` -> `/tmp/pipebench`: times `vkCreateComputePipelines` for one
+  module. Enables shaderImageGatherExtended + shaderStorageImageWriteWithoutFormat, API 1.2
+  (module caps: GroupNonUniform(Ballot), ImageGatherExtended, SignedZeroInfNanPreserve,
+  StorageImageWriteWithoutFormat; SPIR-V 1.3; LocalSize 32 1 1).
+- STATUS: returns -13 immediately — the hardcoded layout (set0: 0=SSBO x10, 3/7/33=sampled
+  image, 44=sampler x5, 48=SSBO; PC 128 B) does not exactly match the engine's real
+  descriptor types. Fix by logging the exact `AddLayoutBindings` result (shaders.cpp:179 site).
+- Once working, module variants can be A/B'd off-line in seconds instead of emulator runs.
+
+## Iteration 34 - fix directions (ranked, none proven yet)
+1. Identify the construct: histogram-diff the monster against the dumped siblings
+   (0xbd2e37f57ad2d6c0 / 0x5191f67261c3b7c4) via a `--graphics-debug-dump` run, then fix the
+   emitter for that pattern. Suspects: 1.5 labels per guest instruction, 1.7k function locals,
+   908 GLSL ExtInst, ~6k Bitcast, ~2.8k Select.
+2. Async/prewarm pipeline compile on a worker thread during load (the m_compile_mutex split
+   makes this feasible); lazy first-use creation makes triggering hard.
+3. NOT viable: driver-cache persistence, DISABLE_OPTIMIZATION, spirv-opt -O/-Os.
+
+## Handoff seed (fresh small-context session)
+- Bug: SpongeBob intro→menu freeze = ONE 41.5 s `vkCreateComputePipelines`
+  (hash 0x1929ac47f3eaefa0), every run (driver cache never persists it).
+- Repro: `cd _Build/linux && KYTY_RENDER_SCALE=0.5 KYTY_RENDER_SCALE_CATS=rt
+  KYTY_PIPELINE_CACHE=1 KYTY_FPS_LOG=1 KYTY_SUB_LOG=1 KYTY_COMPUTE_LOG=1 TIMEOUT=100
+  PRINTF_DIRECTION=File PRINTF_FILE=x.txt ../../tools/run-sponge.sh`
+- Observable: `PipeCreate: driver create ~41455 ms` + `Sub: slow ~43 s`. Fixed = create < 2 s.
+- Logs this session: _Build/linux/{pipeprobe,fastpipe,optspv}_guestlog.txt.
+- Uncommitted code: pipelineCache.cpp (PipeCreate timing KYTY_COMPUTE_LOG; 
+  MaybeOptimizeShaderSpirv KYTY_OPT_SPV env-gated), shaders.cpp (KYTY_FAST_PIPE_COMPILE,
+  proven no-op, env-gated).
+- Instruments: _Build/probe_pipebench.cpp (+ /tmp/pipebench), /tmp/mon_opt.spv.
+- Exact next command: dump-run (`--graphics-debug-dump true`, KYTY_PIPELINE_CACHE=0) to capture
+  the sibling modules, then compare `spirv-dis | grep -o Op[A-Za-z]* | sort | uniq -c`
+  histograms against the monster dump to name the pathological construct.
+

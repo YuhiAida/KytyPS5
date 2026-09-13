@@ -22,6 +22,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -34,6 +35,7 @@
 #include <limits>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
+#include <spirv-tools/optimizer.hpp>
 #include <string_view>
 #include <tuple>
 #include <utility>
@@ -209,6 +211,36 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	return false;
 }
 
+// The recompiler emits functionally correct but structurally heavy SPIR-V for some complex
+// shaders (thousands of basic blocks and function-local variables). The NVIDIA driver then
+// spends tens of seconds compiling such modules (observed: 41.5 s for a 615 KB compute
+// shader). Running the SPIR-V optimizer first removes redundant loads and renames variables,
+// which brings the module back to a shape the driver compiles quickly. Only applied above a
+// size threshold so ordinary shaders are not slowed down; KYTY_OPT_SPV gates the experiment.
+void MaybeOptimizeShaderSpirv(uint64_t shader_hash, std::vector<uint32_t>& spirv) {
+	static constexpr std::size_t k_min_words = 100000;
+	if (std::getenv("KYTY_OPT_SPV") == nullptr || spirv.size() < k_min_words) {
+		return;
+	}
+	const auto begin = std::chrono::steady_clock::now();
+	spvtools::Optimizer optimizer(SPV_ENV_VULKAN_1_3);
+	optimizer.RegisterPerformancePasses();
+	std::vector<uint32_t> optimized;
+	if (!optimizer.Run(spirv.data(), spirv.size(), &optimized) || optimized.empty()) {
+		LOGF("SpirvOpt: hash=0x%016" PRIx64 " failed words=%" PRIu64 "\n", shader_hash,
+		     static_cast<uint64_t>(spirv.size()));
+		return;
+	}
+	LOGF("SpirvOpt: hash=0x%016" PRIx64 " words=%" PRIu64 " -> %" PRIu64
+	     " elapsed_ms=%" PRIu64 "\n",
+	     shader_hash, static_cast<uint64_t>(spirv.size()),
+	     static_cast<uint64_t>(optimized.size()),
+	     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                               std::chrono::steady_clock::now() - begin)
+	                               .count()));
+	spirv = std::move(optimized);
+}
+
 } // namespace
 
 struct PipelineCache::ProgramCache {
@@ -278,6 +310,7 @@ struct PipelineCache::ProgramCache {
 			     options.shader_hash);
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+		MaybeOptimizeShaderSpirv(options.shader_hash, result.spirv);
 
 		vk::ShaderModuleCreateInfo create_info {};
 		create_info.codeSize    = result.spirv.size() * sizeof(uint32_t);
@@ -962,7 +995,12 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 
 	// Creation runs under m_compile_mutex only, so lookups on other threads never wait for it.
+	// Opt-in profile (KYTY_COMPUTE_LOG=1): separates the wait for the compile mutex from the
+	// creation itself, attributing a load-time pipeline storm between queuing and driver
+	// compilation.
+	const auto        pipe_t0 = std::chrono::steady_clock::now();
 	Common::LockGuard compile_lock(m_compile_mutex);
+	const auto        pipe_t1 = std::chrono::steady_clock::now();
 	{
 		Common::LockGuard lock(m_mutex);
 		if (auto iter = m_compute_pipelines.find(compute_program.id);
@@ -977,6 +1015,28 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	auto cached = std::make_unique<Pipeline>();
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	const auto pipe_t2 = std::chrono::steady_clock::now();
+	if (std::getenv("KYTY_COMPUTE_LOG") != nullptr) {
+		const auto ns = [](auto a, auto b) {
+			return static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+		};
+		static std::atomic<uint64_t> acc_wait {0};
+		static std::atomic<uint64_t> acc_create {0};
+		static std::atomic<uint64_t> acc_count {0};
+		static auto                  last = std::chrono::steady_clock::now();
+		acc_wait.fetch_add(ns(pipe_t0, pipe_t1));
+		acc_create.fetch_add(ns(pipe_t1, pipe_t2));
+		acc_count.fetch_add(1);
+		const auto now = std::chrono::steady_clock::now();
+		if (now - last >= std::chrono::seconds(1)) {
+			LOGF("PipeCreate: n=%llu wait=%.0f create=%.0f ms/s\n",
+			     static_cast<unsigned long long>(acc_count.exchange(0)),
+			     static_cast<double>(acc_wait.exchange(0)) / 1.0e6,
+			     static_cast<double>(acc_create.exchange(0)) / 1.0e6);
+			last = now;
+		}
+	}
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);

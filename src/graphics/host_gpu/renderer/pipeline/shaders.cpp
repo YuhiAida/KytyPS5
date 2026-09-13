@@ -612,15 +612,30 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	info.stage             = comp_shader_stage_info;
 	info.layout            = pipeline.pipeline_layout;
 	info.basePipelineIndex = -1;
+	// A single pathological compute shader (large SPIR-V from the recompiler's unoptimized IR)
+	// can make the driver spend tens of seconds in optimization. This switch compiles such
+	// pipelines without driver-side optimization to keep the frame alive.
+	if (std::getenv("KYTY_FAST_PIPE_COMPILE") != nullptr) {
+		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+	}
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
+	const auto cp_create_t0 = std::chrono::steady_clock::now();
 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                &pipeline.pipeline);
+	const auto cp_create_ms =
+	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+	                                              cp_create_t0)
+	        .count();
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
+	if (cp_create_ms >= 50.0) {
+		LOGF("PipeCreate: driver create %.0f ms cache=%p\n", cp_create_ms,
+		     static_cast<void*>(driver_cache));
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
