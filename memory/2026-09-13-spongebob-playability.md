@@ -471,3 +471,25 @@ Phase attribution if needed first: `LogDrawPhase` (debug.cpp:618, gated by
 - 47b11c7 present-tick / vtrig / compute ablations; this round: pipelineCache lock split
   (compile outside m_mutex), GpuCall + extended Compute timing, equeue timeout idents.
 
+## Iteration 28 - GC drain FIXED (completion-tracked); limiter now readback-paced
+- Implemented the completion-tracked release: GC downloads carry a `WritebackBatch` ticket
+  (atomic counter, incremented at queue time, decremented by the priority writeback after it
+  runs). Buffers are released by a later GC pass once the ticket hits zero and no newer GPU
+  writes exist. No queue drain, no priority-queue wait in the reclaim path.
+- Safety fallback added in `DownloadBufferMemory`: when the byte-range set was already consumed
+  by an in-flight download, the tracker-reported bytes are copied straight from the host buffer,
+  so CPU reads never observe stale guest memory during the publication window (the host buffer
+  still holds the GPU data).
+- Verified (`gcfinal_guestlog.txt`): `gc=0` on every `Sub: slow` line (was 580-645 ms per
+  collection), zero big-gc stalls, no crashes, clean exit. Commit 8a154ac.
+- Slow-phase fps unchanged (~1.0-1.4) - the next layer is quantified:
+  `Readback: count=21/s wait=932-1633 ms/s max=921 ms` (pm4_guestlog.txt). The frame time is now
+  the sum of readback-synchronized GPU work (~44 ms average per synchronous readback; the guest
+  polls GPU results ~21x/s). In-order queue: each readback must wait for the GPU to consume the
+  backlog since the last poll, so the remaining cost is the GPU work per poll window - i.e. the
+  compute storm itself, no longer emulator-side serialization.
+- Next: (a) profile one readback interval's GPU work (dispatch stats within ~44 ms windows);
+  (b) with the serialization drains out of the way, revisit render-scale / shader efficiency for
+  the 4K-grid integer-shader storm; (c) menu-load time should now be measured end-to-end again
+  (the gc stalls used to add ~0.6 s per collection during the load).
+
