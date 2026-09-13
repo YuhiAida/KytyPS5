@@ -137,7 +137,8 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
-bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                       const std::shared_ptr<WritebackBatch>& batch) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -145,11 +146,20 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "buffer download");
+		    const auto before = copies.size();
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
 			    copies.emplace_back(start - buffer_address, total_size, end - start);
 			    // Keep packed ranges on separate cache lines, as in shadPS4.
 			    total_size += Common::AlignUp(end - start, 64);
 		    });
+		    if (copies.size() == before) {
+			    // The byte-range set was already consumed by an earlier download that is still
+			    // publishing (garbage collection defers its release). Copy the tracker-reported
+			    // bytes straight from the host buffer so readers never observe stale guest memory
+			    // while that download is in flight.
+			    copies.emplace_back(address - buffer_address, total_size, bytes);
+			    total_size += Common::AlignUp(bytes, 64);
+		    }
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 	    });
 	if (copies.empty()) {
@@ -192,12 +202,18 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
+	if (batch != nullptr) {
+		batch->pending.fetch_add(1, std::memory_order_acq_rel);
+	}
 	m_scheduler.DeferPriorityOperation([this, mapped, offset, total_size, buffer_address,
-	                                    copies = std::move(copies)] {
+	                                    copies = std::move(copies), batch] {
 		m_download_buffer.Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);
+		}
+		if (batch != nullptr) {
+			batch->pending.fetch_sub(1, std::memory_order_acq_rel);
 		}
 	});
 	return true;
@@ -629,6 +645,32 @@ void BufferCache::RunGarbageCollector(bool force) {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
+	// Release downloads queued by an earlier pass once their writebacks have published. The old
+	// code drained the whole GPU queue here (measured 580-645 ms per collection while the GPU
+	// was busy); the wait is now spread across passes instead of stalling the command
+	// processor. Buffers touched by newer GPU writes stay registered and are re-collected.
+	if (!m_pending_release.empty()) {
+		if (m_pending_batch != nullptr && m_pending_batch->pending.load() != 0) {
+			return;
+		}
+		for (const auto& pending: m_pending_release) {
+			if (m_slot_buffers.try_get(pending.id) == nullptr) {
+				continue;
+			}
+			if (m_gpu_modified_ranges.Intersects(pending.address, pending.size)) {
+				continue;
+			}
+			m_memory_tracker.UnmarkRegionAsGpuModified(pending.address, pending.size);
+			if (m_memory_tracker.IsRegionGpuModified(pending.address, pending.size)) {
+				continue;
+			}
+			m_memory_tracker.UntrackMemory(pending.address, pending.size);
+			Unregister(pending.id);
+			m_slot_buffers.erase(pending.id);
+		}
+		m_pending_release.clear();
+		m_pending_batch = nullptr;
+	}
 	if (!force && m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
@@ -637,11 +679,17 @@ void BufferCache::RunGarbageCollector(bool force) {
 	const uint64_t age        = force ? 0 : std::min<uint64_t>(aggressive ? 80 : 160, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 
-	std::vector<BufferId> dirty_buffers;
-	size_t                retire_count = 0;
+	std::shared_ptr<WritebackBatch> batch;
+	std::vector<BufferId>           dirty_buffers;
+	size_t                          retire_count = 0;
 	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
+		if (std::find_if(m_pending_release.begin(), m_pending_release.end(),
+		                 [id](const PendingRelease& pending) { return pending.id == id; }) !=
+		    m_pending_release.end()) {
+			return false;
+		}
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
@@ -651,7 +699,10 @@ void BufferCache::RunGarbageCollector(bool force) {
 		if (dirty) {
 			// A failed download must not abort the emulator (forced passes run under memory
 			// pressure): keep the buffer and retry on the next collection.
-			if (!DownloadBufferMemory(buffer, buffer.CpuAddress(), buffer.Size())) {
+			if (batch == nullptr) {
+				batch = std::make_shared<WritebackBatch>();
+			}
+			if (!DownloadBufferMemory(buffer, buffer.CpuAddress(), buffer.Size(), batch)) {
 				return false;
 			}
 			dirty_buffers.push_back(id);
@@ -665,20 +716,11 @@ void BufferCache::RunGarbageCollector(bool force) {
 		return;
 	}
 
-	// Publish all queued downloads before releasing their tracked pages and owners.
-	const auto completion_tick = m_scheduler.CurrentTick();
-	m_scheduler.Wait(completion_tick);
-	m_scheduler.WaitPriorityOperations(completion_tick);
+	m_pending_batch = std::move(batch);
 	for (const auto id: dirty_buffers) {
 		auto& buffer = m_slot_buffers[id];
-		m_memory_tracker.UnmarkRegionAsGpuModified(buffer.CpuAddress(), buffer.Size());
-		if (m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size()) ||
-		    m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size())) {
-			EXIT("BufferCache: garbage collection retained GPU ownership\n");
-		}
-		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
-		Unregister(id);
-		m_slot_buffers.erase(id);
+		m_pending_release.push_back(
+		    PendingRelease {.id = id, .address = buffer.CpuAddress(), .size = buffer.Size()});
 	}
 }
 
