@@ -1305,6 +1305,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		static std::atomic<uint64_t> max_groups {0};
 		static uint64_t              top_addr[64] {};
 		static uint64_t              top_count[64] {};
+		static uint64_t              top_groups[64] {};
 		if (enabled) {
 			count.fetch_add(1);
 			const auto total = static_cast<uint64_t>(std::max(thread_group_x, 1u)) *
@@ -1318,14 +1319,16 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			for (uint32_t i = 0; i < 64 && !found; i++) {
 				if (top_addr[i] == addr) {
 					top_count[i]++;
+					top_groups[i] += total;
 					found = true;
 				}
 			}
 			for (uint32_t i = 0; i < 64 && !found; i++) {
 				if (top_addr[i] == 0) {
-					top_addr[i]  = addr;
-					top_count[i] = 1;
-					found        = true;
+					top_addr[i]   = addr;
+					top_count[i]  = 1;
+					top_groups[i] = total;
+					found         = true;
 				}
 			}
 			static auto last = std::chrono::steady_clock::now();
@@ -1346,14 +1349,18 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 					if (best == 64) {
 						break;
 					}
-					LOGF("Dispatch:   shader=0x%016" PRIx64 " calls=%llu\n", top_addr[best],
-					     static_cast<unsigned long long>(top_count[best]));
-					top_addr[best]  = 0;
-					top_count[best] = 0;
+					LOGF("Dispatch:   shader=0x%016" PRIx64 " calls=%llu groups=%llu avg_groups=%llu\n",
+					     top_addr[best], static_cast<unsigned long long>(top_count[best]),
+					     static_cast<unsigned long long>(top_groups[best]),
+					     static_cast<unsigned long long>(top_groups[best] / top_count[best]));
+					top_addr[best]   = 0;
+					top_count[best]  = 0;
+					top_groups[best] = 0;
 				}
 				for (uint32_t i = 0; i < 64; i++) {
-					top_addr[i]  = 0;
-					top_count[i] = 0;
+					top_addr[i]   = 0;
+					top_count[i]  = 0;
+					top_groups[i] = 0;
 				}
 				last = now;
 			}
