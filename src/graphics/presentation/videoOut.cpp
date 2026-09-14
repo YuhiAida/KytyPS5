@@ -857,6 +857,11 @@ static void RecordPresentedFrame() {
 		         per_s(Phase::PipePrep),
 		     per_s(Phase::BindPrep), per_s(Phase::VtxPrep), per_s(Phase::RtPrep),
 		     per_s(Phase::PipePrep));
+		LOGF("Present: bind=%.0f(img=%.0f smp=%.0f find=%.0f rbuf=%.0f rimg=%.0f) ms/s\n",
+		     per_s(Phase::PbImages) + per_s(Phase::PbSamplers) + per_s(Phase::FbFind) +
+		         per_s(Phase::RbBuffers) + per_s(Phase::RbImages),
+		     per_s(Phase::PbImages), per_s(Phase::PbSamplers), per_s(Phase::FbFind),
+		     per_s(Phase::RbBuffers), per_s(Phase::RbImages));
 		frames       = 0;
 		max_gap_ms   = 0.0;
 		window_start = now;

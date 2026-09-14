@@ -37,6 +37,11 @@ enum class Phase : uint32_t {
 	VtxPrep,        //   ..   .. AcquireVertexBuffers + PrepareIndexBuffer
 	RtPrep,         //   ..   .. AcquireRenderTargets
 	PipePrep,       //   ..   .. PipelineCache::GetGraphicsPipeline
+	PbImages,       //   .. PrepareBindings: ResolveTexture + BindImage per bound image
+	PbSamplers,     //   .. PrepareBindings: NativeSampler per sampler + shader data dwords
+	FbFind,         //   .. FindBuffers: BufferCache::FindBuffer per bound buffer
+	RbBuffers,      //   .. RebindBuffers: NativeStorageBuffer + NativeUpload
+	RbImages,       //   .. RebindImages: TextureCache::FindTexture per bound image
 	ExecCommit,     //   .. CommitVertexBuffers/CommitBindings/CommitIndexBuffer, dynamic params
 	ExecEmit,       //   .. BeginRendering, bindPipeline, the vkCmdDraw* itself
 	Count,

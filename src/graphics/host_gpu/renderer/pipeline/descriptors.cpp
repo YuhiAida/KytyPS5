@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/gpuPhaseStats.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -729,21 +730,27 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	const auto& snapshot = runtime.resources;
 	PreparedBindings prepared;
 	prepared.runtime = &runtime;
-	prepared.images.reserve(program.info.images.size());
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
-		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
-		prepared.images.push_back(std::move(binding));
+	{
+		GpuPhaseStats::Scope pb_images(GpuPhaseStats::Phase::PbImages);
+		prepared.images.reserve(program.info.images.size());
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+			prepared.images.push_back(std::move(binding));
+		}
 	}
-	prepared.samplers.reserve(program.info.samplers.size());
-	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-		prepared.samplers.push_back(NativeSampler(m_context, program, i, snapshot.samplers[i]));
+	{
+		GpuPhaseStats::Scope pb_samplers(GpuPhaseStats::Phase::PbSamplers);
+		prepared.samplers.reserve(program.info.samplers.size());
+		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
+			prepared.samplers.push_back(NativeSampler(m_context, program, i, snapshot.samplers[i]));
+		}
+		prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
+		for (const auto reg: program.bindings.user_data_registers) {
+			prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
+		}
+		prepared.shader_data.resize(program.bindings.ShaderDataDwords());
 	}
-	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
-	for (const auto reg: program.bindings.user_data_registers) {
-		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
-	}
-	prepared.shader_data.resize(program.bindings.ShaderDataDwords());
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
@@ -753,6 +760,7 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 
 void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	GpuPhaseStats::Scope phase(GpuPhaseStats::Phase::FbFind);
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;
 	const auto& snapshot = prepared.runtime->resources;
@@ -775,6 +783,7 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	GpuPhaseStats::Scope phase(GpuPhaseStats::Phase::RbBuffers);
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program   = *prepared.runtime->program;
 	const auto& snapshot  = prepared.runtime->resources;
@@ -810,6 +819,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	GpuPhaseStats::Scope phase(GpuPhaseStats::Phase::RbImages);
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;
 	const auto& snapshot = prepared.runtime->resources;
