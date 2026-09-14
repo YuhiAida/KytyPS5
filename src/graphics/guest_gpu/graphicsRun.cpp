@@ -570,46 +570,57 @@ static void LogSubmissionTime(double ms);
 
 // Opt-in PM4 profile (KYTY_OPCODE_LOG=1): command volume per second plus the five most
 // expensive packet handlers, so a translation-bound frame can be attributed to opcodes.
-// Nested packets (inside indirect buffers) are accumulated separately: their time is already
-// contained in the enclosing IT_INDIRECT_BUFFER packet's time.
+//
+// `ms` is *self* time: the indirect-buffer handler recurses back into ProcessPm4, so a handler's
+// elapsed time normally contains everything its nested stream did. ProcessPm4 keeps a
+// thread-local running total of nested time per level and subtracts it here, which is why the
+// reported total stays in the same order as the wall clock instead of being multiplied by the
+// nesting depth. The second count (n=%llu) is how many of the packets sat inside an indirect
+// buffer rather than in the top-level stream.
 static void RecordOpcodeTime(uint32_t opcode, uint32_t sub_code, uint32_t depth, double ms,
                              uint64_t dwords) {
 	static const bool enabled = std::getenv("KYTY_OPCODE_LOG") != nullptr;
 	if (!enabled) {
 		return;
 	}
-	static double   acc_ms[256] = {};
-	static uint64_t acc_dw[256] = {};
-	static double   nested_ms[256] = {};
-	static double   nop_ms[256] = {};
-	static uint64_t nop_dw[256] = {};
-	static uint64_t window_dw   = 0;
-	static auto     window_start = std::chrono::steady_clock::now();
+	static double   top_ms[256]     = {};
+	static uint64_t top_count[256]  = {};
+	static double   nest_ms[256]    = {};
+	static uint64_t nest_count[256] = {};
+	static double   nop_ms[256]     = {};
+	static uint64_t nop_count[256]  = {};
+	static uint64_t window_dw       = 0;
+	static uint64_t window_pkts     = 0;
+	static auto     window_start    = std::chrono::steady_clock::now();
 	if (opcode < 256) {
 		if (depth <= 1) {
-			acc_ms[opcode] += ms;
-			acc_dw[opcode]++;
+			top_ms[opcode] += ms;
+			top_count[opcode]++;
 		} else {
-			nested_ms[opcode] += ms;
+			nest_ms[opcode] += ms;
+			nest_count[opcode]++;
 		}
 		if (opcode == Pm4::IT_NOP && sub_code < 256) {
 			nop_ms[sub_code] += ms;
-			nop_dw[sub_code]++;
+			nop_count[sub_code]++;
 		}
 	}
 	window_dw += dwords;
-	const auto now = std::chrono::steady_clock::now();
+	window_pkts++;
+	const auto now     = std::chrono::steady_clock::now();
 	const auto elapsed = std::chrono::duration<double>(now - window_start).count();
 	if (elapsed < 1.0) {
 		return;
 	}
-	int best[5] = {-1, -1, -1, -1, -1};
+	const auto total_ms = [](uint32_t index) { return top_ms[index] + nest_ms[index]; };
+	int        best[5]  = {-1, -1, -1, -1, -1};
 	for (int i = 0; i < 256; i++) {
-		if (acc_ms[i] <= 0.0) {
+		if (total_ms(static_cast<uint32_t>(i)) <= 0.0) {
 			continue;
 		}
 		for (int slot = 0; slot < 5; slot++) {
-			if (best[slot] < 0 || acc_ms[i] > acc_ms[best[slot]]) {
+			if (best[slot] < 0 || total_ms(static_cast<uint32_t>(i)) >
+			                          total_ms(static_cast<uint32_t>(best[slot]))) {
 				for (int move = 4; move > slot; move--) {
 					best[move] = best[move - 1];
 				}
@@ -618,11 +629,15 @@ static void RecordOpcodeTime(uint32_t opcode, uint32_t sub_code, uint32_t depth,
 			}
 		}
 	}
-	LOGF("PM4: %.1f MB/s commands:", static_cast<double>(window_dw) * 4.0 / elapsed / 1048576.0);
+	LOGF("PM4: %.1f MB/s pkts=%llu:",
+	     static_cast<double>(window_dw) * 4.0 / elapsed / 1048576.0,
+	     static_cast<unsigned long long>(window_pkts));
 	for (int slot = 0; slot < 5; slot++) {
 		if (best[slot] >= 0) {
-			LOGF(" op%02x=%.0fms(%llu)", best[slot], acc_ms[best[slot]],
-			     static_cast<unsigned long long>(acc_dw[best[slot]]));
+			LOGF(" op%02x=%.0fms(%llu n=%llu)", best[slot],
+			     total_ms(static_cast<uint32_t>(best[slot])),
+			     static_cast<unsigned long long>(top_count[best[slot]]),
+			     static_cast<unsigned long long>(nest_count[best[slot]]));
 		}
 	}
 	// IT_NOP carries custom operations; break them down by their sub-code so the expensive
@@ -645,38 +660,20 @@ static void RecordOpcodeTime(uint32_t opcode, uint32_t sub_code, uint32_t depth,
 	for (int slot = 0; slot < 3; slot++) {
 		if (nop_best[slot] >= 0) {
 			LOGF(" nop.r%02x=%.0fms(%llu)", nop_best[slot], nop_ms[nop_best[slot]],
-			     static_cast<unsigned long long>(nop_dw[nop_best[slot]]));
-		}
-	}
-	int nested_best[3] = {-1, -1, -1};
-	for (int i = 0; i < 256; i++) {
-		if (nested_ms[i] <= 0.0) {
-			continue;
-		}
-		for (int slot = 0; slot < 3; slot++) {
-			if (nested_best[slot] < 0 || nested_ms[i] > nested_ms[nested_best[slot]]) {
-				for (int move = 2; move > slot; move--) {
-					nested_best[move] = nested_best[move - 1];
-				}
-				nested_best[slot] = i;
-				break;
-			}
-		}
-	}
-	for (int slot = 0; slot < 3; slot++) {
-		if (nested_best[slot] >= 0) {
-			LOGF(" in%02x=%.0fms", nested_best[slot], nested_ms[nested_best[slot]]);
+			     static_cast<unsigned long long>(nop_count[nop_best[slot]]));
 		}
 	}
 	LOGF("\n");
 	for (int i = 0; i < 256; i++) {
-		acc_ms[i]    = 0.0;
-		acc_dw[i]    = 0;
-		nested_ms[i] = 0.0;
-		nop_ms[i]    = 0.0;
-		nop_dw[i]    = 0;
+		top_ms[i]     = 0.0;
+		top_count[i]  = 0;
+		nest_ms[i]    = 0.0;
+		nest_count[i] = 0;
+		nop_ms[i]     = 0.0;
+		nop_count[i]  = 0;
 	}
 	window_dw    = 0;
+	window_pkts  = 0;
 	window_start = now;
 }
 
@@ -882,9 +879,20 @@ void CommandProcessor::SuspendPm4() {
 	g_current_execution->m_suspended = true;
 }
 
+// Nested time accumulated by the levels below the current one; ProcessPm4 restores the parent's
+// value when it returns so self time can be computed per packet.
+static thread_local double g_pm4_child_ms = 0.0;
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
+	// Read once per run, not once per packet: std::getenv walks the environment block, and the
+	// interpreter loop runs hundreds of thousands of times per second in a heavy phase.
+	static const bool opcode_profiled = std::getenv("KYTY_OPCODE_LOG") != nullptr;
+	static const bool no_pm4_drain    = std::getenv("KYTY_NO_PM4_DRAIN") != nullptr;
+	const auto        parent_child_ms = g_pm4_child_ms;
+	double            level_ms        = 0.0;
+	g_pm4_child_ms                    = 0.0;
 	while (execution.m_buffer_stack.size() > stop_depth) {
-		if (g_gpu_state != nullptr && std::getenv("KYTY_NO_PM4_DRAIN") == nullptr) {
+		if (g_gpu_state != nullptr && !no_pm4_drain) {
 			g_gpu_state->ProcessCommands();
 		}
 		const auto buffer_index = execution.m_buffer_stack.size() - 1;
@@ -968,26 +976,37 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
-		const auto packet_begin = std::chrono::steady_clock::now();
+		// The clock reads below only pay for themselves when the opcode profile is on; the whole
+		// point of this loop is that it runs for every packet the guest submits.
+		const auto child_before = g_pm4_child_ms;
+		const auto packet_begin = opcode_profiled ? std::chrono::steady_clock::now()
+		                                          : std::chrono::steady_clock::time_point {};
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
-		RecordOpcodeTime(opcode, opcode == Pm4::IT_NOP ? KYTY_PM4_R(packet_header) : 0u,
-		                 static_cast<uint32_t>(execution.m_buffer_stack.size()),
-		                 std::chrono::duration<double, std::milli>(
-		                     std::chrono::steady_clock::now() - packet_begin)
-		                     .count(),
-		                 packet_dw);
+		if (opcode_profiled) {
+			const auto inclusive_ms =
+			    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+			                                              packet_begin)
+			        .count();
+			const auto child_ms = g_pm4_child_ms - child_before;
+			RecordOpcodeTime(opcode, opcode == Pm4::IT_NOP ? KYTY_PM4_R(packet_header) : 0u,
+			                 static_cast<uint32_t>(execution.m_buffer_stack.size()),
+			                 inclusive_ms - child_ms, packet_dw);
+			level_ms += inclusive_ms;
+		}
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			if (execution.m_buffer_stack.size() > buffer_index + 1) {
 				execution.m_buffer_stack[buffer_index].deferred_advance_dw = packet_dw;
 			}
+			g_pm4_child_ms = parent_child_ms + level_ms;
 			return;
 		}
 		EXIT_IF(execution.m_buffer_stack.size() != buffer_index + 1);
 		execution.m_buffer_stack[buffer_index].offset_dw += packet_dw;
 		execution.m_made_progress = true;
 	}
+	g_pm4_child_ms = parent_child_ms + level_ms;
 }
 
 void CommandProcessor::SetIndexType(uint32_t index_type_and_size) {

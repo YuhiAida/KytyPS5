@@ -31,6 +31,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(add_help=True, description=__doc__)
     parser.add_argument("log")
     parser.add_argument("--tail", type=int, default=0)
+    parser.add_argument("--range", dest="window_range", default="",
+                        help="only use windows A:B (1-based, inclusive; same game time across runs)")
     args = parser.parse_args()
 
     path = pathlib.Path(args.log)
@@ -64,17 +66,27 @@ def main() -> int:
     tail = args.tail if args.tail > 0 else windows
     tail = min(tail, windows)
 
-    def last(values: list[float]) -> list[float]:
-        return values[-tail:] if len(values) >= tail else values
+    if args.window_range:
+        start_text, _, end_text = args.window_range.partition(":")
+        start = max(1, int(start_text) if start_text else 1)
+        end = min(windows, int(end_text) if end_text else windows)
+    elif args.tail > 0:
+        start, end = max(1, windows - tail + 1), windows
+    else:
+        start, end = 1, windows
+    indices = list(range(start - 1, end))
 
-    print(f"phase digest: {path}  windows={windows} using last {tail}")
-    print(f"fps (same windows): mean={statistics.mean(last(fps)):.1f} "
-          f"median={statistics.median(last(fps)):.1f}")
+    def select(values: list[float]) -> list[float]:
+        return [values[i] for i in indices if i < len(values)]
+
+    print(f"phase digest: {path}  windows={windows} using {start}-{end}")
+    print(f"fps (same windows): mean={statistics.mean(select(fps)):.1f} "
+          f"median={statistics.median(select(fps)):.1f}")
     for name in BUCKETS:
-        values = last(buckets[name])
+        values = select(buckets[name])
         if not values:
             continue
-        counts_values = last(counts[name])
+        counts_values = select(counts[name])
         count_note = f" events/s={statistics.mean(counts_values):.0f}" if counts_values else ""
         print(f"  {name:9s} mean={statistics.mean(values):7.1f} "
               f"median={statistics.median(values):7.1f} max={max(values):7.1f} ms/s{count_note}")
