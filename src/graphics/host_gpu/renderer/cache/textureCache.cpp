@@ -1630,7 +1630,30 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		RefreshImage(id);
 	}
 	switch (desc.type) {
-		case BindingType::Texture: break;
+		case BindingType::Texture:
+			if (std::getenv("KYTY_BIND_LOG") != nullptr && !image.info.data.Empty()) {
+				static std::atomic<uint32_t> bind_log {0};
+				const auto fmt      = static_cast<uint32_t>(image.backing.format);
+				const bool interest = (fmt >= 131 && fmt <= 146) || image.info.extent.width >= 1024 ||
+				                      image.info.extent.height >= 1024;
+				if (interest && bind_log.fetch_add(1, std::memory_order_relaxed) < 96) {
+					LOGF("Bind: tex addr=0x%016" PRIx64 " image_fmt=%u view_fmt=%u ext=%ux%u "
+					     "mip=%u+%u/%u layer=%u+%u/%u size=0x%" PRIx64 "\n",
+					     image.info.data.address, static_cast<uint32_t>(image.backing.format),
+					     static_cast<uint32_t>(desc.view_info.format), image.info.extent.width,
+					     image.info.extent.height, desc.view_info.base_level,
+					     desc.view_info.level_count, image.info.resources.levels,
+					     desc.view_info.base_layer, desc.view_info.layer_count,
+					     image.info.resources.layers, image.info.data.size);
+				}
+			}
+			// Temporary experiment gate: re-upload the host image from guest memory on every bind, to
+			// tell a stale host image apart from a wrong upload source.
+			if (std::getenv("KYTY_FORCE_TEX_REUPLOAD") != nullptr && !image.info.data.Empty()) {
+				image.MarkBufferModified();
+				RefreshImage(id);
+			}
+			break;
 		case BindingType::Storage:
 			if (!image.info.data.Empty()) {
 				CommitGpuWrite(image);
