@@ -862,6 +862,12 @@ static void RecordPresentedFrame() {
 		         per_s(Phase::RbBuffers) + per_s(Phase::RbImages),
 		     per_s(Phase::PbImages), per_s(Phase::PbSamplers), per_s(Phase::FbFind),
 		     per_s(Phase::RbBuffers), per_s(Phase::RbImages));
+		LOGF("Present: shad=%.0f(vs=%.0f ps=%.0f lookup=%.0f) ms/s\n",
+		     per_s(Phase::ProgsVs) + per_s(Phase::ProgsPs) + per_s(Phase::ProgsLookup),
+		     per_s(Phase::ProgsVs), per_s(Phase::ProgsPs), per_s(Phase::ProgsLookup));
+		LOGF("Present: lookup=%.0f(key=%.0f find=%.0f matl=%.0f) ms/s\n",
+		     per_s(Phase::ProgKey) + per_s(Phase::ProgFind) + per_s(Phase::ProgMatl),
+		     per_s(Phase::ProgKey), per_s(Phase::ProgFind), per_s(Phase::ProgMatl));
 		frames       = 0;
 		max_gap_ms   = 0.0;
 		window_start = now;

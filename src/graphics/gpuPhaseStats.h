@@ -42,6 +42,12 @@ enum class Phase : uint32_t {
 	FbFind,         //   .. FindBuffers: BufferCache::FindBuffer per bound buffer
 	RbBuffers,      //   .. RebindBuffers: NativeStorageBuffer + NativeUpload
 	RbImages,       //   .. RebindImages: TextureCache::FindTexture per bound image
+	ProgsVs,        //   .. GetGraphicsPrograms: PrepareProgram for the vertex stage
+	ProgsPs,        //   .. GetGraphicsPrograms: PrepareProgram for the pixel stage
+	ProgsLookup,    //   .. GetGraphicsPrograms: the program-cache lookups
+	ProgKey,        //   ..   .. BuildStageStaticKey (the per-draw lookup key)
+	ProgFind,       //   ..   .. the hash-map find
+	ProgMatl,       //   ..   .. MaterializeResources on a hit
 	ExecCommit,     //   .. CommitVertexBuffers/CommitBindings/CommitIndexBuffer, dynamic params
 	ExecEmit,       //   .. BeginRendering, bindPipeline, the vkCmdDraw* itself
 	Count,

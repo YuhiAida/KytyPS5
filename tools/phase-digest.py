@@ -23,7 +23,8 @@ import sys
 
 BUCKETS = ("pm4", "proc", "gc", "flush", "readback", "flushwait", "waitcur", "waitother",
            "finish", "draw", "pre", "check", "ix", "state", "shad", "exec", "prep", "commit",
-           "emit", "bind", "vtx", "rt", "pipe", "img", "smp", "find", "rbuf", "rimg")
+           "emit", "bind", "vtx", "rt", "pipe", "img", "smp", "find", "rbuf", "rimg", "vs",
+           "ps", "lookup", "key", "matl")
 MS_RE = re.compile(r"([a-z0-9]+)=([0-9.]+)")
 COUNT_RE = re.compile(r"([a-z0-9]+)=[0-9.]+\\(n=([0-9]+)\\)")
 FPS_RE = re.compile(r"Present: fps=([0-9.]+)")
@@ -49,7 +50,8 @@ def main() -> int:
     with path.open("r", errors="ignore") as handle:
         for line in handle:
             if line.startswith(("Present: cpu ", "Present: draw=", "Present: exec=",
-                                "Present: prep=", "Present: bind=")):
+                                "Present: prep=", "Present: bind=", "Present: shad=",
+                                "Present: lookup=")):
                 for name, value in MS_RE.findall(line):
                     if name in buckets:
                         buckets[name].append(float(value))

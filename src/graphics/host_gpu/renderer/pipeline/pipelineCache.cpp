@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/gpuPhaseStats.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -377,10 +378,14 @@ struct PipelineCache::ProgramCache {
 		key.hash            = params.hash;
 		key.user_data_count = static_cast<uint32_t>(params.user_data.size());
 		key.code_size       = static_cast<uint32_t>(params.code.size());
+		const auto prog_key_begin = GpuPhaseStats::Begin();
 		BuildStageStaticKey(input_info, key.static_state);
+		GpuPhaseStats::AddSince(GpuPhaseStats::Phase::ProgKey, prog_key_begin);
 
 		cache_mutex.Lock();
+		const auto prog_find_begin = GpuPhaseStats::Begin();
 		auto                                         entry = programs.find(key);
+		GpuPhaseStats::AddSince(GpuPhaseStats::Phase::ProgFind, prog_find_begin);
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
@@ -389,8 +394,10 @@ struct PipelineCache::ProgramCache {
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
 		if (entry != programs.end()) {
+			const auto prog_matl_begin = GpuPhaseStats::Begin();
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, resources, specialization));
+			GpuPhaseStats::AddSince(GpuPhaseStats::Phase::ProgMatl, prog_matl_begin);
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
@@ -757,7 +764,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
     ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info) {
+	const auto vs_prep_begin = GpuPhaseStats::Begin();
 	const auto vertex_params = PrepareProgram(vertex_regs, context, user_config, vertex_info);
+	GpuPhaseStats::AddSince(GpuPhaseStats::Phase::ProgsVs, vs_prep_begin);
 	const bool mesh_active   = vertex_info.mesh.threads_num[0] != 0;
 	if (mesh_active) {
 		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
@@ -779,7 +788,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	ShaderParams pixel_params;
 	if (pixel_active) {
+		const auto ps_prep_begin = GpuPhaseStats::Begin();
 		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		GpuPhaseStats::AddSince(GpuPhaseStats::Phase::ProgsPs, ps_prep_begin);
 	}
 	if (context.GetClipControl().clip_disable) {
 		const auto& viewport = context.GetScreenViewport().viewports[0];
@@ -798,12 +809,14 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	uint32_t         push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms result;
+	const auto       progs_lookup_begin = GpuPhaseStats::Begin();
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor, m_mutex,
 		                                    m_compile_mutex);
 	}
 	result.vertex =
 	    m_program_cache->Get(vertex_params, vertex_info, push_data_cursor, m_mutex, m_compile_mutex);
+	GpuPhaseStats::AddSince(GpuPhaseStats::Phase::ProgsLookup, progs_lookup_begin);
 	return result;
 }
 
