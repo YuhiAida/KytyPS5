@@ -291,8 +291,13 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 			    static_cast<uint64_t>(std::strtoull(reserve_mib, nullptr, 10)) * 1024 * 1024;
 		}
 		const auto heap = m_graphics.GetDeviceLocalHeapSize();
-		if (heap > desktop_reserve + 2 * GiB) {
-			const auto target    = heap - desktop_reserve;
+		auto       target = heap - std::min(desktop_reserve, heap / 4);
+		// The live system budget can be smaller than the heap (other apps); planning to fill more
+		// than that keeps the cache permanently over budget and thrashes. Target the minimum.
+		if (const auto budget = m_graphics.GetTotalMemoryBudget(); budget != 0 && budget < target) {
+			target = budget;
+		}
+		if (heap > desktop_reserve + 2 * GiB && target != 0) {
 			m_critical_gc_memory = target - target / 8;
 			m_pressure_gc_memory = target - target / 4;
 			m_trigger_gc_memory  = target - target / 2;
@@ -447,14 +452,26 @@ float WantedRenderScale(GraphicContext& graphics, TextureCache::BindingType type
 		return 1.0f;
 	}
 	// Scaling is opt-in: native extents unless --render-scale (or KYTY_RENDER_SCALE, which
-	// overrides it for experiments) asks for less. Scaled transfers resample through a
-	// guest-extent staging image, so the window size no longer has to match the guest output.
+	// overrides it for experiments) asks for less. "auto" renders at the window resolution,
+	// which keeps the guest's 4K surfaces from filling VRAM on a 720p window. Scaled transfers
+	// resample through a guest-extent staging image, so the window size no longer has to match
+	// the guest output.
 	float scale = Config::GetRenderScale();
 	if (const char* env = std::getenv("KYTY_RENDER_SCALE")) {
-		const float parsed = std::strtof(env, nullptr);
-		if (parsed > 0.0f && parsed <= 1.0f) {
-			scale = parsed;
+		if (std::strcmp(env, "auto") == 0) {
+			scale = 0.0f;
+		} else {
+			const float parsed = std::strtof(env, nullptr);
+			if (parsed > 0.0f && parsed <= 1.0f) {
+				scale = parsed;
+			}
 		}
+	}
+	if (scale == 0.0f) {
+		const auto width  = static_cast<float>(Config::GetScreenWidth());
+		const auto height = static_cast<float>(Config::GetScreenHeight());
+		scale = std::min({1.0f, width / static_cast<float>(info.extent.width),
+		                  height / static_cast<float>(info.extent.height)});
 	}
 	return (scale > 0.0f && scale < 1.0f) ? scale : 1.0f;
 }
@@ -2294,14 +2311,14 @@ void TextureCache::RunGarbageCollector(bool force) {
 		bool           pressured  = force || m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive =
 		    force || (allow_aggressive && m_total_used_memory >= m_critical_gc_memory);
-		// A title that streams more than the device budget cannot be protected by a
-		// wide "recently used" window: keep only what the current frame touches
-		// (streamed textures are re-uploadable from guest memory) and collect more
-		// per pass so the heap stays inside its budget instead of spilling.
+		// Retention ages in frames: a texture touched within this many frames stays cached.
+		// The old windows (4/16/64) evicted textures the game streams back every second,
+		// turning pressure into a re-upload storm (measured: +350 same-content uploads/s).
+		// Widening them stops actively-streamed textures from cycling through VRAM.
 		const uint64_t age =
 		    force ? 0
-		          : std::min<uint64_t>(aggressive ? 4 : pressured ? 16 : 64, tick);
-		size_t deletions = force ? 768 : aggressive ? 512 : pressured ? 128 : 32;
+		          : std::min<uint64_t>(aggressive ? 60 : pressured ? 300 : 600, tick);
+		size_t deletions = force ? 768 : aggressive ? 256 : pressured ? 64 : 32;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
