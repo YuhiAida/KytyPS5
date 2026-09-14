@@ -446,13 +446,17 @@ float WantedRenderScale(GraphicContext& graphics, TextureCache::BindingType type
 	if (info.extent.width == 0 || info.extent.height == 0) {
 		return 1.0f;
 	}
+	// Scaling is opt-in: native extents unless --render-scale (or KYTY_RENDER_SCALE, which
+	// overrides it for experiments) asks for less. Scaled transfers resample through a
+	// guest-extent staging image, so the window size no longer has to match the guest output.
+	float scale = Config::GetRenderScale();
 	if (const char* env = std::getenv("KYTY_RENDER_SCALE")) {
 		const float parsed = std::strtof(env, nullptr);
-		return (parsed > 0.0f && parsed < 1.0f) ? parsed : 1.0f;
+		if (parsed > 0.0f && parsed <= 1.0f) {
+			scale = parsed;
+		}
 	}
-	// The window-size default stays opt-in until scaled transfers resample instead of clamping:
-	// a scaled backing whose guest-extent transfers are cropped renders invalid content.
-	return 1.0f;
+	return (scale > 0.0f && scale < 1.0f) ? scale : 1.0f;
 }
 
 } // namespace

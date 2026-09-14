@@ -35,6 +35,10 @@ uint32_t GetScreenHeight() {
 	return g_config->screen_height;
 }
 
+float GetRenderScale() {
+	return g_config->render_scale;
+}
+
 const std::string& GetUserName() {
 	return g_config->user_name;
 }

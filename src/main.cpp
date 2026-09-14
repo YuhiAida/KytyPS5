@@ -55,6 +55,8 @@ static void PrintUsage() {
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
+	::printf("  --render-scale <scale>               Render at this fraction of the guest\n");
+	::printf("                                       resolution (0 < scale <= 1). Default: 1.0.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
@@ -246,6 +248,9 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			const int32_t vblank_frequency = Common::ToInt32(value);
 			options.config.vblank_frequency =
 			    static_cast<uint32_t>(vblank_frequency < 0 ? 0 : vblank_frequency);
+		} else if (arg == "--render-scale") {
+			const float scale = std::strtof(value.c_str(), nullptr);
+			options.config.render_scale = (scale > 0.0F && scale <= 1.0F) ? scale : 1.0F;
 		} else if (arg == "--console-language") {
 			if (!ParseConsoleLanguage(value, options.config.console_language)) {
 				::printf("invalid console language: %s\n", value.c_str());
