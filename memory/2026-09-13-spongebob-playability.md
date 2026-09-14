@@ -744,3 +744,31 @@ proven unscalable on this GPU
 - Per-packet work in `ProcessPm4` is unconditional: `std::getenv("KYTY_NO_PM4_DRAIN")`,
   `GraphicsRunDebugDumpEnabled()`, and two `steady_clock::now()` calls feeding the opcode profiler.
   Cheap first candidates, share unmeasured.
+
+## Iteration 48 - the interpreter cost is the draw path, and the draw path is state resolution
+- Cached those per-packet lookups and gated the profiler clock reads: **no measurable change**
+  (pm4 895 -> 905 ms/s at the same game time, fps unchanged). Kept as hygiene; it was not the win.
+- `KYTY_OPCODE_LOG` now reports handler *self* time (it was inclusive, so the indirect-buffer
+  recursion multiplied it by the nesting depth). Steady phase, ~10.8 fps, pm4=882-905 ms/s:
+  `op35 IT_DRAW_INDEX_OFFSET_2` 357 ms/s (~9k draws/s, 39 us each), `op15 IT_DISPATCH_DIRECT` 163,
+  `op25 IT_DRAW_INDEX_INDIRECT` 119, `op2d IT_DRAW_INDEX_AUTO` 119, `op3f IT_INDIRECT_BUFFER` 55,
+  `op16 IT_DISPATCH_INDIRECT` 40. Draws and dispatches are ~90% of the interpreter.
+- Draws split (per draw, ~41 us total): `shad` (program resolution) ~14 us, `bind`
+  (PrepareGraphicsBindings) ~15-23 us, `rt` (AcquireRenderTargets) ~4 us, everything else
+  (index setup, vertex buffers, pipeline lookup, descriptor commit, `vkCmdDrawIndexed`) ~4 us
+  combined. `uc_check`/`hw_check`/topology: 0.
+- Inside `bind`: rimg (FindTexture) 54, find (FindBuffer) 40, img (ResolveTexture) 35,
+  rbuf (NativeStorageBuffer + uploads) 27, samplers 0 (already cached).
+- Inside `shad`: PrepareProgram 10 (VS) / 0 (PS), key build 0, hash-map find 20,
+  **MaterializeResources 141 ms/s** - the snapshot and specialization are rebuilt per stage per
+  draw from the immutable plan, with vector copies of plan data and guest-memory reads.
+
+## Iteration 49 - how much of that work could be skipped (measured)
+- Repeat rate against the previous draw: programs 74-75%, image bindings 76-77%, buffer bindings
+  26-30%, whole draw state identical 26-30% (9.5-10k draws/s).
+- So: an all-or-nothing prepared-state cache would skip only ~27%; per-part memoisation of program
+  resolution (~95 ms/s, 75% hit) and image resolution (~68 ms/s, 76% hit) is where the money is,
+  while buffer caching does not pay (addresses move).
+- Path to 30 fps, honestly: the per-draw cost is ~41 us at ~900 draws/frame. Halving it gives
+  ~16 fps; 30 fps needs the per-draw state pipeline to change shape (memoised snapshots handed out
+  by pointer/shared ownership, batching, or GPU-side state), not another local optimisation.
