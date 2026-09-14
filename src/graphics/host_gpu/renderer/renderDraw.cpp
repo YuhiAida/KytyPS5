@@ -1086,8 +1086,77 @@ static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBu
 	vk_buffer.bindIndexBuffer(prepared.buffer, prepared.offset, prepared.type);
 }
 
+// Diagnostic (enabled with KYTY_FPS_LOG, and reported once per second next to the phase
+// breakdown): does a draw repeat the previous draw's resolved state? The per-draw profile is
+// dominated by re-resolving bindings and programs, so the repeat rate says how much of that work
+// a prepared-state cache could skip. Only the fields a cache would key on are compared.
+// Bindings is RenderExecutor::GraphicsBindings, a private nested type: take it as a template
+// parameter so this helper does not need to name it.
+template <class Bindings>
+static void RecordDrawStateRepeat(const PipelineCache::GraphicsPrograms& programs,
+                                  const Bindings&                        bindings) {
+	struct Fingerprint {
+		uint64_t programs = 0;
+		uint64_t images   = 0;
+		uint64_t buffers  = 0;
+	};
+	static Fingerprint previous;
+	static uint64_t    draws        = 0;
+	static uint64_t    same_programs = 0;
+	static uint64_t    same_images  = 0;
+	static uint64_t    same_buffers = 0;
+	static uint64_t    same_all     = 0;
+	static auto        window_start = std::chrono::steady_clock::now();
+
+	constexpr uint64_t kOffset = 14695981039346656037ull;
+	constexpr uint64_t kPrime  = 1099511628211ull;
+	Fingerprint        current;
+	current.programs = programs.vertex.id * kPrime ^ programs.pixel.id;
+	current.images   = kOffset;
+	current.buffers  = kOffset;
+	for (const auto* stage: {&bindings.vertex, bindings.pixel ? &*bindings.pixel : nullptr}) {
+		if (stage == nullptr) {
+			continue;
+		}
+		for (const auto& image: stage->images) {
+			current.images =
+			    (current.images ^ (static_cast<uint64_t>(image.image_id.index) << 32u) ^
+			     image.image_id.generation) *
+			    kPrime;
+		}
+		for (const auto& source: stage->buffer_sources) {
+			current.buffers = (current.buffers ^ source.address ^ source.size) * kPrime;
+		}
+	}
+
+	draws++;
+	same_programs += current.programs == previous.programs;
+	same_images += current.images == previous.images;
+	same_buffers += current.buffers == previous.buffers;
+	same_all += current.programs == previous.programs && current.images == previous.images &&
+	            current.buffers == previous.buffers;
+	previous = current;
+
+	const auto now     = std::chrono::steady_clock::now();
+	const auto elapsed = std::chrono::duration<double>(now - window_start).count();
+	if (elapsed >= 1.0) {
+		const auto pct = [](uint64_t hits, uint64_t total) {
+			return total == 0 ? 0.0 : 100.0 * static_cast<double>(hits) / static_cast<double>(total);
+		};
+		LOGF("Present: repeat draws=%llu prog=%.0f%% img=%.0f%% buf=%.0f%% all=%.0f%%\n",
+		     static_cast<unsigned long long>(draws), pct(same_programs, draws),
+		     pct(same_images, draws), pct(same_buffers, draws), pct(same_all, draws));
+		draws         = 0;
+		same_programs = 0;
+		same_images   = 0;
+		same_buffers  = 0;
+		same_all      = 0;
+		window_start  = now;
+	}
+}
+
 static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo& draw,
-	                             const DrawRenderState& state, uint32_t index_type_and_size,
+                                 const DrawRenderState& state, uint32_t index_type_and_size,
                                  const void* index_addr) {
 	if (!graphics_debug_dump_enabled()) {
 		return;
@@ -1201,6 +1270,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	LogDrawPhase(draw.Name(), "PrepareBindings");
 	auto bindings = PrepareGraphicsBindings(state.vs_input_info.stage, state.ps_input_info.stage,
 	                                        state.ps_active);
+	if (GpuPhaseStats::Enabled()) {
+		RecordDrawStateRepeat(state.programs, bindings);
+	}
 	GpuPhaseStats::AddSince(GpuPhaseStats::Phase::BindPrep, bind_prep_begin);
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
