@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/gpuPhaseStats.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -323,11 +324,12 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				m_scheduler.Wait(tick);
 				m_scheduler.WaitPriorityOperations(tick);
 			}
-			RecordReadbackWait(
+			const auto wait_ms =
 			    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
 			                                              wait_begin)
-			        .count(),
-			    window_begin, window_end - window_begin, is_write, size);
+			        .count();
+			GpuPhaseStats::Add(GpuPhaseStats::Phase::Readback, wait_ms);
+			RecordReadbackWait(wait_ms, window_begin, window_end - window_begin, is_write, size);
 			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
 		}
 		if (is_write) {

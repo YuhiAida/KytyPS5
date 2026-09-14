@@ -10,6 +10,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/gpuPhaseStats.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
@@ -834,6 +835,17 @@ static void RecordPresentedFrame() {
 	if (elapsed >= 1.0) {
 		LOGF("Present: fps=%.1f maxgap=%.1f ms\n", static_cast<double>(frames) / elapsed,
 		     max_gap_ms);
+		using Phase      = GpuPhaseStats::Phase;
+		const auto stats = GpuPhaseStats::Take();
+		const auto per_s = [&stats, elapsed](Phase phase) { return stats.Ms(phase) / elapsed; };
+		LOGF("Present: cpu pm4=%.0f(proc=%.0f gc=%.0f flush=%.0f) readback=%.0f(n=%llu) "
+		     "flushwait=%.0f waitcur=%.0f(n=%llu) waitother=%.0f finish=%.0f ms/s\n",
+		     per_s(Phase::Submit), per_s(Phase::Pm4Process), per_s(Phase::Pm4Gc),
+		     per_s(Phase::Pm4Flush), per_s(Phase::Readback),
+		     static_cast<unsigned long long>(stats.Count(Phase::Readback)),
+		     per_s(Phase::FlushWait), per_s(Phase::GpuWaitCurrent),
+		     static_cast<unsigned long long>(stats.Count(Phase::GpuWaitCurrent)),
+		     per_s(Phase::GpuWaitOther), per_s(Phase::GpuWaitFinish));
 		frames       = 0;
 		max_gap_ms   = 0.0;
 		window_start = now;

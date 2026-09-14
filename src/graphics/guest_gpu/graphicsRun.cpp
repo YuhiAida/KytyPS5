@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/gpuPhaseStats.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -796,6 +797,10 @@ bool GuestGpu::Process(Submission& submission) {
 		     static_cast<int>(submission.type));
 	}
 	LogSubmissionTime(total_ms);
+	GpuPhaseStats::Add(GpuPhaseStats::Phase::Submit, total_ms);
+	GpuPhaseStats::Add(GpuPhaseStats::Phase::Pm4Process, process_ms);
+	GpuPhaseStats::Add(GpuPhaseStats::Phase::Pm4Gc, gc_ms);
+	GpuPhaseStats::Add(GpuPhaseStats::Phase::Pm4Flush, flush_ms);
 	if (total_ms >= 100.0) {
 		LOGF("Sub: slow %.0f ms (translate=%.0f gc=%.0f flush=%.0f)\n", total_ms, process_ms, gc_ms,
 		     flush_ms);

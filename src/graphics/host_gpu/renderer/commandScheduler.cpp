@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/gpuPhaseStats.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
@@ -252,24 +253,36 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 }
 
 void CommandScheduler::FlushAndWait() {
-	const auto tick = Submit();
+	const auto wait_begin = std::chrono::steady_clock::now();
+	const auto tick       = Submit();
 	m_master.Wait(tick, "flush-wait");
 	BeginNext();
+	GpuPhaseStats::Add(GpuPhaseStats::Phase::FlushWait,
+	                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+	                                                             wait_begin)
+	                       .count());
 }
 
 void CommandScheduler::Finish() {
 	CheckActive();
+	const auto wait_begin = std::chrono::steady_clock::now();
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
 	m_master.Wait(CurrentTick() - 1, "finish");
 	BeginNext();
 	PopPendingOperations();
+	GpuPhaseStats::Add(GpuPhaseStats::Phase::GpuWaitFinish,
+	                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+	                                                             wait_begin)
+	                       .count());
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
 	EXIT_IF(tick > CurrentTick());
-	if (tick == CurrentTick()) {
+	const auto wait_begin = std::chrono::steady_clock::now();
+	const auto is_current = (tick == CurrentTick());
+	if (is_current) {
 		CheckActive();
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
 		// Current(). The wrapper stays stable while its pooled Vulkan buffer is retired. Deferred
@@ -281,6 +294,11 @@ void CommandScheduler::Wait(uint64_t tick) {
 	} else {
 		m_master.Wait(tick, "wait");
 	}
+	GpuPhaseStats::Add(is_current ? GpuPhaseStats::Phase::GpuWaitCurrent
+	                              : GpuPhaseStats::Phase::GpuWaitOther,
+	                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+	                                                             wait_begin)
+	                       .count());
 }
 
 void CommandScheduler::PopPendingOperations() {

@@ -723,3 +723,24 @@ proven unscalable on this GPU
 - Tests: `shader_recompiler_compute_tests` passes; `shader_cfg_tests` fails on a DS-lane decode
   case in a binary built before this session (untouched area). ctest reports every test "Not Run"
   (container-relative paths) - run the binaries from `_Build/linux-ci/` directly.
+
+## Iteration 47 - the frame is PM4 translation, not raster and not readback (measured)
+- New instrument: `src/graphics/gpuPhaseStats.h` + `tools/phase-digest.py`. The KYTY_FPS_LOG line
+  now prints a per-second CPU breakdown: `pm4(proc/gc/flush) readback flushwait waitcur waitother
+  finish`, all wall times around existing blocking calls, off unless the fps log is on.
+- Steady menu phase at render-scale auto (~10.5 fps, ~95 ms per frame):
+  `pm4=916 ms/s` of which `proc=900` (the `CommandProcessor::Process` translation loop),
+  `readback=114 ms/s` over 120 events/s, `waitcur=119 ms/s` over 120 events/s, `finish=10 ms/s`,
+  gc/flush ~15 ms/s. The guest GPU thread is ~92 % busy inside the interpreter: the frame is
+  CPU-bound on PM4 translation. That is consistent with the idle GPU (~55 % util) and explains why
+  more raster scaling stopped paying.
+- Consequence: the readback/drain serialisation is **not** the wall (~11 ms/frame), and the
+  "27-57 fps when readbacks are skipped" number from iteration 43 belongs to a lighter phase.
+- `KYTY_OPCODE_LOG` on the same phase: 4.0 MB/s of commands; top-level op3f (IT_INDIRECT_BUFFER)
+  dominates and the nested buckets (`in3f` ~29.8 s/s summed over all nesting levels) show the cost
+  lives inside indirect-buffer streams. Nested accumulation adds every level, so it cannot be
+  ranked directly, and the profiler records no nested *counts* - per-opcode self cost is still
+  unknown.
+- Per-packet work in `ProcessPm4` is unconditional: `std::getenv("KYTY_NO_PM4_DRAIN")`,
+  `GraphicsRunDebugDumpEnabled()`, and two `steady_clock::now()` calls feeding the opcode profiler.
+  Cheap first candidates, share unmeasured.
