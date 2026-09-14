@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/gpuPhaseStats.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -1301,30 +1302,37 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 
+	// The draw path is the interpreter's dominant cost, so its stages are timed for the phase
+	// breakdown (see GpuPhaseStats); the scopes are free unless the fps log is on.
+	GpuPhaseStats::Scope draw_total(GpuPhaseStats::Phase::DrawTotal);
+
 	EXIT_IF(buffer.IsInvalid());
 	const bool gpu_indirect = args.indirect_args_addr != 0;
 	EXIT_IF(!gpu_indirect && args.offset_source == DrawOffsetSource::DrawState &&
 	        args.first_instance != 0);
-	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
+	{
+		GpuPhaseStats::Scope draw_pre(GpuPhaseStats::Phase::DrawPre);
+		m_context.GetCommandScheduler().PopPendingOperations();
 
-	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DrawIndex), submit_id,
-	                    args.index_count, 0, 1, args.instance_count,
-	                    reinterpret_cast<uint64_t>(args.index_addr));
+		buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DrawIndex), submit_id,
+		                    args.index_count, 0, 1, args.instance_count,
+		                    reinterpret_cast<uint64_t>(args.index_addr));
 
-	Common::LockGuard lock(m_context.GetMutex());
-	if (!gpu_indirect && (args.index_count == 0 || args.instance_count == 0)) {
-		return;
-	}
+		Common::LockGuard lock(m_context.GetMutex());
+		if (!gpu_indirect && (args.index_count == 0 || args.instance_count == 0)) {
+			return;
+		}
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer)) {
-		ResetBindings();
-		return;
-	}
+		if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer)) {
+			ResetBindings();
+			return;
+		}
 
-	if (!DrawHasValidVertexShader(sh_ctx)) {
-		return;
+		if (!DrawHasValidVertexShader(sh_ctx)) {
+			return;
+		}
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1344,13 +1352,16 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		     static_cast<uint32_t>(args.base_vertex), args.first_instance);
 	}
 
-	uc_check(ucfg);
-
-	hw_check(buffer);
-
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
-	if (!GetDrawTopology(ucfg, false, topology)) {
-		return;
+	{
+		GpuPhaseStats::Scope draw_check(GpuPhaseStats::Phase::DrawCheck);
+		uc_check(ucfg);
+
+		hw_check(buffer);
+
+		if (!GetDrawTopology(ucfg, false, topology)) {
+			return;
+		}
 	}
 
 	DrawIndexBufferSource index_source {};
@@ -1421,9 +1432,12 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		emit.indirect_args_offset = args_offset;
 	}
 
-	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
-	                    primitive_restart);
-	ResetBindings();
+	{
+		GpuPhaseStats::Scope draw_execute(GpuPhaseStats::Phase::DrawExecute);
+		ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
+		                    primitive_restart);
+		ResetBindings();
+	}
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)

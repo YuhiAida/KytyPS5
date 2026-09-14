@@ -2,6 +2,7 @@
 #define GRAPHICS_GPU_PHASE_STATS_H_
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 
@@ -25,6 +26,11 @@ enum class Phase : uint32_t {
 	GpuWaitCurrent, // CommandScheduler::Wait for the current tick (flushes, then waits)
 	GpuWaitOther,   // CommandScheduler::Wait for an older tick
 	GpuWaitFinish,  // CommandScheduler::Finish, called on the guest GPU thread once per frame
+	DrawTotal,      // RenderExecutor::DrawIndex, whole call
+	DrawPre,        //   .. prologue: pending operations, lock, early-out checks
+	DrawCheck,      //   .. uc_check/hw_check/topology
+	DrawPrepare,    //   .. index source, PrepareDrawRenderState, shaders, offsets
+	DrawExecute,    //   .. ExecutePreparedDraw + ResetBindings
 	Count,
 };
 
@@ -46,6 +52,30 @@ inline void Add(Phase phase, double ms) {
 	g_micros[index].fetch_add(static_cast<uint64_t>(ms * 1000.0), std::memory_order_relaxed);
 	g_counts[index].fetch_add(1, std::memory_order_relaxed);
 }
+
+// Times a region and records it on destruction, so early returns inside the region are measured
+// too. The enabled flag is sampled once, at construction.
+class Scope {
+public:
+	explicit Scope(Phase phase)
+	    : m_phase(phase), m_enabled(Enabled()),
+	      m_begin(m_enabled ? std::chrono::steady_clock::now()
+	                        : std::chrono::steady_clock::time_point {}) {}
+	Scope(const Scope&)            = delete;
+	Scope& operator=(const Scope&) = delete;
+	~Scope() {
+		if (m_enabled) {
+			Add(m_phase, std::chrono::duration<double, std::milli>(
+			                 std::chrono::steady_clock::now() - m_begin)
+			                 .count());
+		}
+	}
+
+private:
+	Phase                                 m_phase;
+	bool                                  m_enabled;
+	std::chrono::steady_clock::time_point m_begin;
+};
 
 struct Snapshot {
 	double   ms[kPhaseCount] {};
