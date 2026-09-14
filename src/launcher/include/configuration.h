@@ -66,6 +66,11 @@ public:
 	enum class PresentMode { Fifo, Mailbox, Immediate };
 	Q_ENUM(PresentMode)
 
+	// Host render scale: "100" is native, the others render at a fraction of the guest extent and
+	// "Auto" matches the window resolution (only surfaces larger than the window shrink).
+	enum class RenderScale { R100, R75, R50, Auto };
+	Q_ENUM(RenderScale)
+
 	enum class LogDirection { Silent, Console, File };
 	Q_ENUM(LogDirection)
 
@@ -85,6 +90,7 @@ public:
 	QString    game_comment;
 
 	Resolution             screen_resolution           = Resolution::R1280X720;
+	RenderScale            render_scale                = RenderScale::Auto;
 	QString                user_name                   = "Kyty";
 	int                    user_id                     = Config::DEFAULT_USER_ID;
 	PresentMode            present_mode                = PresentMode::Mailbox;
@@ -113,6 +119,7 @@ public:
 
 	void CopyEmulatorSettingsFrom(const Configuration& other) {
 		screen_resolution           = other.screen_resolution;
+		render_scale                = other.render_scale;
 		user_name                   = other.user_name;
 		user_id                     = other.user_id;
 		present_mode                = other.present_mode;
@@ -158,6 +165,7 @@ public:
 		KYTY_CFG_SET(game_path);
 		KYTY_CFG_SET(custom_settings);
 		KYTY_CFG_SET(screen_resolution);
+		KYTY_CFG_SET(render_scale);
 		KYTY_CFG_SET(user_name);
 		KYTY_CFG_SET(user_id);
 		KYTY_CFG_SET(present_mode);
@@ -190,6 +198,12 @@ public:
 		KYTY_CFG_GET(game_path);
 		KYTY_CFG_GET(custom_settings);
 		KYTY_CFG_GET(screen_resolution);
+		KYTY_CFG_GET(render_scale);
+		if (!s->contains("render_scale") || EnumToText(render_scale).isEmpty()) {
+			// The key is new: configurations written before it start at "Auto", which only scales
+			// surfaces larger than the window (a 4K guest on a 720p window today).
+			render_scale = RenderScale::Auto;
+		}
 		user_name          = s->value("user_name", user_name).toString();
 		bool user_id_ok    = false;
 		auto saved_user_id = s->value("user_id", user_id).toInt(&user_id_ok);

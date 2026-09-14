@@ -436,8 +436,11 @@ bool Image::ResampleUpload(std::span<const vk::BufferImageCopy> copies, vk::Buff
 		return false;
 	}
 	const auto features = m_graphics.GetFormatProperties(backing.format).optimalTilingFeatures;
-	if (!static_cast<bool>(features & (vk::FormatFeatureFlagBits::eBlitSrc |
-	                                   vk::FormatFeatureFlagBits::eBlitDst))) {
+	// The staging image and the scaled backing share this format and both serve as blit source and
+	// destination, so both bits must be present (see WantedRenderScale for why compressed formats
+	// without BLIT_DST must not reach this path).
+	if (!static_cast<bool>(features & vk::FormatFeatureFlagBits::eBlitSrc) ||
+	    !static_cast<bool>(features & vk::FormatFeatureFlagBits::eBlitDst)) {
 		return false;
 	}
 	const auto filter = static_cast<bool>(features & vk::FormatFeatureFlagBits::eSampledImageFilterLinear)
@@ -552,8 +555,10 @@ bool Image::ResampleDownload(std::span<const vk::BufferImageCopy> copies, vk::Bu
 		return false;
 	}
 	const auto features = m_graphics.GetFormatProperties(backing.format).optimalTilingFeatures;
-	if (!static_cast<bool>(features & (vk::FormatFeatureFlagBits::eBlitSrc |
-	                                   vk::FormatFeatureFlagBits::eBlitDst))) {
+	// Symmetric with the upload path: both sides of the blit use this format, so both bits are
+	// needed.
+	if (!static_cast<bool>(features & vk::FormatFeatureFlagBits::eBlitSrc) ||
+	    !static_cast<bool>(features & vk::FormatFeatureFlagBits::eBlitDst)) {
 		return false;
 	}
 	const auto filter = static_cast<bool>(features & vk::FormatFeatureFlagBits::eSampledImageFilterLinear)

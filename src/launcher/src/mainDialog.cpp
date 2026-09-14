@@ -226,6 +226,13 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 
 	args << "--screen-width" << r.at(0);
 	args << "--screen-height" << r.at(1);
+	// "auto" renders at the window resolution; 100 means native (no scaling).
+	switch (info.render_scale) {
+		case Configuration::RenderScale::R100: args << "--render-scale" << "1"; break;
+		case Configuration::RenderScale::R75: args << "--render-scale" << "0.75"; break;
+		case Configuration::RenderScale::R50: args << "--render-scale" << "0.5"; break;
+		case Configuration::RenderScale::Auto: args << "--render-scale" << "auto"; break;
+	}
 	args << "--user-name" << info.user_name;
 	args << "--user-id" << QString::number(info.user_id);
 	args << "--present-mode" << EnumToText(info.present_mode);

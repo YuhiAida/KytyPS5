@@ -56,8 +56,9 @@ static void PrintUsage() {
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --render-scale <scale>               Render at this fraction of the guest\n");
-	::printf("                                       resolution (0 < scale <= 1), or 'auto' to\n");
-	::printf("                                       match the window size. Default: 1.0.\n");
+	::printf("                                       resolution (0 < scale <= 1 or 'native'),\n");
+	::printf("                                       or 'auto' to match the window size.\n");
+	::printf("                                       Default: 1.0 (native).\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
@@ -253,9 +254,18 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			if (value == "auto") {
 				// Auto matches the window resolution (0 is the sentinel for it).
 				options.config.render_scale = 0.0F;
+			} else if (value == "native" || value == "off") {
+				options.config.render_scale = 1.0F;
 			} else {
-				const float scale = std::strtof(value.c_str(), nullptr);
-				options.config.render_scale = (scale > 0.0F && scale <= 1.0F) ? scale : 1.0F;
+				char*       end   = nullptr;
+				const float scale = std::strtof(value.c_str(), &end);
+				if (end == value.c_str() || *end != '\0' || scale <= 0.0F || scale > 1.0F) {
+					::printf(
+					    "invalid render scale: %s (expected 'auto', 'native', or 0 < scale <= 1)\n",
+					    value.c_str());
+					return false;
+				}
+				options.config.render_scale = scale;
 			}
 		} else if (arg == "--console-language") {
 			if (!ParseConsoleLanguage(value, options.config.console_language)) {

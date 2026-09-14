@@ -693,3 +693,33 @@ Phase attribution if needed first: `LogDrawPhase` (debug.cpp:618, gated by
 - Steady-state A/B (180 s runs, last 12 s): ~8.4 fps at scale 1.0 vs ~11.1 fps at scale 0.5
   (+30 %) at the same ~63 % GPU load. The scene is hitch-bound (recurring 100-350 ms maxgaps,
   shaders still compiling), so the scale stays opt-in; correctness first by default.
+
+## Iteration 46 - window-resolution rendering becomes the launcher default; compressed textures
+proven unscalable on this GPU
+- Validated `docs/handoff-resolution-fps.md` against the code: all mechanics confirmed, plus three
+  corrections - the blit gate tested *either* blit bit; scaled host extents are pixel-rounded where
+  compressed images need 4x4 block alignment; and "VideoOut must force native extent" is a code
+  fact whose consequence is unproven (for forcing it native would present stale guest memory, so it
+  was audited and deliberately left alone).
+- New `tools/probe-bc-blit.sh` (bare Vulkan instance, runs on the host): the RTX 3060 Ti reports
+  BC1..BC7 `optimalTilingFeatures = 0x1d401` = SAMPLED|BLIT_SRC|LINEAR|TRANSFER_SRC|TRANSFER_DST,
+  i.e. **no BLIT_DST** (R8G8B8A8 control = 0x1dd83, has it). Both resample directions need the
+  compressed format as the blit *destination*, so the handoff's "BC formats ARE blittable" is
+  refuted here: removing the IsBlock guard would record an invalid blit, not a slow one. The driver
+  does accept BC images at extents that are not a multiple of 4 (the VU is not enforced).
+- Changes: `WantedRenderScale` now requires both blit bits (compressed stays native because the
+  hardware says so, not because of a hardcoded guard), default categories are `rt,tex`, "auto"
+  reads the live window extent from the graphic context (config as fallback), `--render-scale`
+  accepts 'native'/'off' and rejects bad values instead of silently using 1.0, and the launcher has
+  a "Render scale" combo (100 / 75 / 50 / Auto) that defaults to Auto for new and existing configs.
+- Verified: Vulkan validation layers ON with `--render-scale auto` for 90 s -> 0 VUID, 0 validation
+  errors, run reaches the timeout (no abort). Menu scenario 150 s at auto: ~10-12 fps,
+  `fallback_memory=0`, GPU ~60 %; native in the same session: ~3.5-7.9 fps with 9 fallback-memory
+  allocations.
+- Screenshots: the 45 s frame is correct; the 90 s frame shows the known menu-background flap, and
+  a pre-change capture (`docs/screenshots/small_rs_shot_2.jpg`) carries the identical artifact, so
+  texture scaling did not introduce it. Present dumps stopping mid-run is the dump's
+  `m_pending_dump` guard after a stall - observed in native runs too.
+- Tests: `shader_recompiler_compute_tests` passes; `shader_cfg_tests` fails on a DS-lane decode
+  case in a binary built before this session (untouched area). ctest reports every test "Not Run"
+  (container-relative paths) - run the binaries from `_Build/linux-ci/` directly.

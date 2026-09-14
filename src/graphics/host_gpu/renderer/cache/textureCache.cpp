@@ -370,7 +370,7 @@ bool TextureCache::SafeToDownload(const Image& image) {
 
 namespace {
 
-// Render scale: host backing images of render targets and depth targets are scaled so the
+// Render scale: host backing images of render targets and sampled textures are scaled so the
 // guest renders at the emulator window resolution. Guest image metadata (layout, pitch,
 // tiling) stays untouched; only the host extent shrinks. Returns 1.0 when no scaling applies.
 //
@@ -405,15 +405,15 @@ float WantedRenderScale(GraphicContext& graphics, TextureCache::BindingType type
 	if (IsRenderScaleSkippedAddress(info.data.address)) {
 		return 1.0f;
 	}
-	// Diagnostic escape hatch: scale every binding (textures included) to measure how much of
-	// the frame is texture bandwidth vs render-target work. Not a correctness path.
-	// KYTY_RENDER_SCALE_CATS narrows that to a comma-separated subset of the categories
-	// "rt" (render/depth targets, the default), "tex" (sampled textures), "sto" (storage
-	// images, whose compute dispatch dimensions are not scaled by extent alone) and "vo"
-	// (video-out surfaces); ALL=1 means all of them.
+	// Diagnostic escape hatches: ALL/CATS override the default categories to measure where the
+	// frame time goes. Defaults are "rt" (render/depth targets) and "tex" (sampled textures),
+	// which is what the measurements showed pays off - the guest renders 4K surfaces into a
+	// 1280x720 window. "sto" (storage images, whose compute dispatch dimensions are not scaled
+	// by extent alone) and "vo" (video-out surfaces) stay off unless asked for; CATS narrows to
+	// a comma-separated subset of the four.
 	const bool all = std::getenv("KYTY_RENDER_SCALE_ALL") != nullptr;
-	bool       rt  = !all;
-	bool       tex = all;
+	bool       rt  = true;
+	bool       tex = true;
 	bool       sto = all;
 	bool       vo  = all;
 	if (const char* cats = std::getenv("KYTY_RENDER_SCALE_CATS")) {
@@ -436,16 +436,22 @@ float WantedRenderScale(GraphicContext& graphics, TextureCache::BindingType type
 	if (!wanted) {
 		return 1.0f;
 	}
-	// Resampled transfers need a blittable single-sample colour format; compressed, depth and
-	// multisampled surfaces keep their native size until their transfers are proven correct.
+	// Resampled transfers need a blittable single-sample colour format. Depth and multisampled
+	// surfaces stay native, and so do block-compressed ones: the staging image and the scaled
+	// backing share the format and act as blit source *and* destination, so both bits are
+	// required - and the Vulkan specification only guarantees BLIT_SRC for BC formats.
+	// Measured with tools/probe-bc-blit.sh on the RTX 3060 Ti: every BC format reports
+	// optimalTilingFeatures without BLIT_DST, so scaling a compressed texture would record an
+	// invalid blit rather than a slow one. (A device that does report BLIT_DST for them would
+	// also need the resample level math to round to the 4x4 texel block first.)
 	if (info.IsBlock() || info.IsDepth() || info.samples != 1u ||
 	    info.pixel_format == vk::Format::eUndefined) {
 		return 1.0f;
 	}
 	const auto blit_features =
 	    graphics.GetFormatProperties(info.pixel_format).optimalTilingFeatures;
-	if (!static_cast<bool>(blit_features & (vk::FormatFeatureFlagBits::eBlitSrc |
-	                                        vk::FormatFeatureFlagBits::eBlitDst))) {
+	if (!static_cast<bool>(blit_features & vk::FormatFeatureFlagBits::eBlitSrc) ||
+	    !static_cast<bool>(blit_features & vk::FormatFeatureFlagBits::eBlitDst)) {
 		return 1.0f;
 	}
 	if (info.extent.width == 0 || info.extent.height == 0) {
@@ -468,8 +474,14 @@ float WantedRenderScale(GraphicContext& graphics, TextureCache::BindingType type
 		}
 	}
 	if (scale == 0.0f) {
-		const auto width  = static_cast<float>(Config::GetScreenWidth());
-		const auto height = static_cast<float>(Config::GetScreenHeight());
+		// The graphic context tracks the window that actually exists (a fullscreen or resized
+		// window updates it); the configuration only holds what startup asked for.
+		const auto width =
+		    static_cast<float>(graphics.screen_width != 0 ? graphics.screen_width
+		                                                  : Config::GetScreenWidth());
+		const auto height =
+		    static_cast<float>(graphics.screen_height != 0 ? graphics.screen_height
+		                                                   : Config::GetScreenHeight());
 		scale = std::min({1.0f, width / static_cast<float>(info.extent.width),
 		                  height / static_cast<float>(info.extent.height)});
 	}
