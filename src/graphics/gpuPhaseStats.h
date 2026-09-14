@@ -29,8 +29,16 @@ enum class Phase : uint32_t {
 	DrawTotal,      // RenderExecutor::DrawIndex, whole call
 	DrawPre,        //   .. prologue: pending operations, lock, early-out checks
 	DrawCheck,      //   .. uc_check/hw_check/topology
-	DrawPrepare,    //   .. index source, PrepareDrawRenderState, shaders, offsets
-	DrawExecute,    //   .. ExecutePreparedDraw + ResetBindings
+	PrepIndex,      //   .. index source, primitive restart, 8-bit expansion
+	PrepState,      //   .. PrepareDrawRenderState (render targets, pipeline state)
+	PrepShaders,    //   .. RefreshShaders + LogDrawStateIfNeeded
+	ExecPrepare,    //   .. PrepareGraphicsBindings, vertex/index buffers, RTs, pipeline lookup
+	BindPrep,       //   ..   .. PrepareGraphicsBindings (descriptor sources)
+	VtxPrep,        //   ..   .. AcquireVertexBuffers + PrepareIndexBuffer
+	RtPrep,         //   ..   .. AcquireRenderTargets
+	PipePrep,       //   ..   .. PipelineCache::GetGraphicsPipeline
+	ExecCommit,     //   .. CommitVertexBuffers/CommitBindings/CommitIndexBuffer, dynamic params
+	ExecEmit,       //   .. BeginRendering, bindPipeline, the vkCmdDraw* itself
 	Count,
 };
 
@@ -51,6 +59,20 @@ inline void Add(Phase phase, double ms) {
 	const auto index = static_cast<uint32_t>(phase);
 	g_micros[index].fetch_add(static_cast<uint64_t>(ms * 1000.0), std::memory_order_relaxed);
 	g_counts[index].fetch_add(1, std::memory_order_relaxed);
+}
+
+// For regions that cannot be wrapped in a scope (their locals outlive the region): take a start
+// point with Begin() and close it with AddSince(). Both are free while the breakdown is off.
+[[nodiscard]] inline std::chrono::steady_clock::time_point Begin() {
+	return Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+}
+
+inline void AddSince(Phase phase, const std::chrono::steady_clock::time_point& begin) {
+	if (!Enabled()) {
+		return;
+	}
+	Add(phase, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+	                .count());
 }
 
 // Times a region and records it on destruction, so early returns inside the region are measured

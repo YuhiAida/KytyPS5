@@ -846,9 +846,17 @@ static void RecordPresentedFrame() {
 		     per_s(Phase::FlushWait), per_s(Phase::GpuWaitCurrent),
 		     static_cast<unsigned long long>(stats.Count(Phase::GpuWaitCurrent)),
 		     per_s(Phase::GpuWaitOther), per_s(Phase::GpuWaitFinish));
-		LOGF("Present: draw=%.0f(pre=%.0f check=%.0f prep=%.0f exec=%.0f) ms/s\n",
+		LOGF("Present: draw=%.0f(pre=%.0f check=%.0f ix=%.0f state=%.0f shad=%.0f) ms/s\n",
 		     per_s(Phase::DrawTotal), per_s(Phase::DrawPre), per_s(Phase::DrawCheck),
-		     per_s(Phase::DrawPrepare), per_s(Phase::DrawExecute));
+		     per_s(Phase::PrepIndex), per_s(Phase::PrepState), per_s(Phase::PrepShaders));
+		LOGF("Present: exec=%.0f(prep=%.0f commit=%.0f emit=%.0f) ms/s\n",
+		     per_s(Phase::ExecPrepare) + per_s(Phase::ExecCommit) + per_s(Phase::ExecEmit),
+		     per_s(Phase::ExecPrepare), per_s(Phase::ExecCommit), per_s(Phase::ExecEmit));
+		LOGF("Present: prep=%.0f(bind=%.0f vtx=%.0f rt=%.0f pipe=%.0f) ms/s\n",
+		     per_s(Phase::BindPrep) + per_s(Phase::VtxPrep) + per_s(Phase::RtPrep) +
+		         per_s(Phase::PipePrep),
+		     per_s(Phase::BindPrep), per_s(Phase::VtxPrep), per_s(Phase::RtPrep),
+		     per_s(Phase::PipePrep));
 		frames       = 0;
 		max_gap_ms   = 0.0;
 		window_start = now;

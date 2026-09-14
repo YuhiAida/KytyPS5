@@ -1196,31 +1196,42 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    index_source.address, static_cast<uint64_t>(draw.index_count) *
 		                              index_source.guest_element_size);
 	}
+	const auto exec_prep_begin = GpuPhaseStats::Begin();
+	const auto bind_prep_begin = GpuPhaseStats::Begin();
 	LogDrawPhase(draw.Name(), "PrepareBindings");
 	auto bindings = PrepareGraphicsBindings(state.vs_input_info.stage, state.ps_input_info.stage,
 	                                        state.ps_active);
+	GpuPhaseStats::AddSince(GpuPhaseStats::Phase::BindPrep, bind_prep_begin);
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
+	const auto            vtx_prep_begin = GpuPhaseStats::Begin();
 	if (!mesh_active) {
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vs_input_info);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
+	GpuPhaseStats::AddSince(GpuPhaseStats::Phase::VtxPrep, vtx_prep_begin);
+	const auto rt_prep_begin = GpuPhaseStats::Begin();
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         bindings.pixel);
+	GpuPhaseStats::AddSince(GpuPhaseStats::Phase::RtPrep, rt_prep_begin);
 
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
+	const auto pipe_prep_begin = GpuPhaseStats::Begin();
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs.vertex, state.programs.pixel);
+	GpuPhaseStats::AddSince(GpuPhaseStats::Phase::PipePrep, pipe_prep_begin);
+	GpuPhaseStats::AddSince(GpuPhaseStats::Phase::ExecPrepare, exec_prep_begin);
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
+	const auto exec_commit_begin = GpuPhaseStats::Begin();
 	auto vk_buffer = buffer.Handle();
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
 	if (!mesh_active) {
@@ -1262,6 +1273,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		        : vk::ImageAspectFlags {});
 	}
 
+	GpuPhaseStats::AddSince(GpuPhaseStats::Phase::ExecCommit, exec_commit_begin);
+
+	const auto exec_emit_begin = GpuPhaseStats::Begin();
 	LogDrawPhase(draw.Name(), "BeginRendering");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
@@ -1276,6 +1290,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
 	}
+	GpuPhaseStats::AddSince(GpuPhaseStats::Phase::ExecEmit, exec_emit_begin);
 
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
@@ -1365,6 +1380,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	DrawIndexBufferSource index_source {};
+	const auto             prep_index_begin = GpuPhaseStats::Begin();
 	index_source.address = reinterpret_cast<uint64_t>(args.index_addr);
 	switch (static_cast<Prospero::IndexType>(args.index_type_and_size)) {
 		case Prospero::IndexType::kIndex16:
@@ -1400,20 +1416,26 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		index_source.size      = expanded_indices.size() * sizeof(uint16_t);
 	}
 
+	GpuPhaseStats::AddSince(GpuPhaseStats::Phase::PrepIndex, prep_index_begin);
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex,
 	                        gpu_indirect ? 0u : args.index_count,
 	                        gpu_indirect ? 0u : args.instance_count,
 	                        gpu_indirect ? 0u : args.first_instance};
 	DrawRenderState state {};
-	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
-		ResetBindings();
-		return;
+	{
+		GpuPhaseStats::Scope draw_prep_state(GpuPhaseStats::Phase::PrepState);
+		if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+			ResetBindings();
+			return;
+		}
 	}
 
-	RefreshShaders(buffer, draw, state);
+	{
+		GpuPhaseStats::Scope draw_prep_shaders(GpuPhaseStats::Phase::PrepShaders);
+		RefreshShaders(buffer, draw, state);
 
-	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
-	                     args.index_addr);
+		LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size, args.index_addr);
+	}
 
 	const bool indirect = args.offset_source == DrawOffsetSource::IndirectArgs;
 	const auto [vertex_offset, instance_offset] =
@@ -1432,12 +1454,9 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		emit.indirect_args_offset = args_offset;
 	}
 
-	{
-		GpuPhaseStats::Scope draw_execute(GpuPhaseStats::Phase::DrawExecute);
-		ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
-		                    primitive_restart);
-		ResetBindings();
-	}
+	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
+	                    primitive_restart);
+	ResetBindings();
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
