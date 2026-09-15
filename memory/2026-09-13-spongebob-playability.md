@@ -763,6 +763,27 @@ proven unscalable on this GPU
   **MaterializeResources 141 ms/s** - the snapshot and specialization are rebuilt per stage per
   draw from the immutable plan, with vector copies of plan data and guest-memory reads.
 
+## Iteration 50 - user report: missing menu background and a flat grey world in game
+- Repro evidence collected with present dumps (menu/gameplay reached without input; the game
+  auto-progresses in some runs, so match the *scene*, never the timestamp):
+  - `--render-scale 1` (native), 80 s, dialog scene ("TALK TO SQUIDWARD"): the world renders
+    (underwater room) - `docs/screenshots/ab_native_80s.png`.
+  - `auto` with `KYTY_RENDER_SCALE_CATS=rt` (textures native, only render targets scaled), 90 s,
+    the *same* dialog scene: the world is flat grey while the UI and its textures are correct -
+    `docs/screenshots/ab_texoff_90s.png`.
+  - So **texture scaling is not the cause** (it is off in the grey run) and render-target scaling
+    correlates: same scene, scaled RTs -> grey world.
+- Second symptom in the same runs: with scaling on, the present-dump stream stops early (13-16
+  dumps, last at ~39 s of a 150 s run) while native runs keep dumping (44 dumps). The present path
+  therefore stalls (the dump's `m_pending_dump` guard never clears) - consistent with the
+  "grey = content produced into a scaled target and never composited" family of bugs.
+- Working hypothesis (not yet proven): a size-carrying site in the scaled path still assumes guest
+  extents (the v2 design list: tiler, resolve, CopyImage/CopyMip, DCC clears, presenter copies).
+  That list was never fully audited.
+- Immediate workaround for the user: launcher *Render scale* = 100 (native) renders correctly.
+- Next: deterministic repro (drive into the world with `tools/drive-game.sh`) capturing frames for
+  auto vs native at the same scene, then bisect the size-carrying sites above.
+
 ## Iteration 49 - how much of that work could be skipped (measured)
 - Repeat rate against the previous draw: programs 74-75%, image bindings 76-77%, buffer bindings
   26-30%, whole draw state identical 26-30% (9.5-10k draws/s).
