@@ -13,6 +13,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
+#include <atomic>
 #include <cstring>
 #include <limits>
 
@@ -117,9 +118,15 @@ void WriteAtEndOfPipeClockCounter(uint64_t submit_id, CommandBuffer& buffer, uin
 	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), 0,
 	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::Write);
 
-	LOGF_COLOR(Log::Color::BrightGreen,
-	           "EndOfPipe Signal!!! [0x%016" PRIx64 "] <- Clock: 0x%016" PRIx64 "\n",
-	           reinterpret_cast<uint64_t>(dst_gpu_addr), value);
+	// Clock-counter end-of-pipe writes happen on every GPU wait (hundreds per second in a
+	// demanding title). Logging each one costs about half a millisecond and floods the log, so
+	// keep only the first few for diagnostics.
+	static std::atomic<uint32_t> clock_log_count {0};
+	if (clock_log_count.fetch_add(1) < 64) {
+		LOGF_COLOR(Log::Color::BrightGreen,
+		           "EndOfPipe Signal!!! [0x%016" PRIx64 "] <- Clock: 0x%016" PRIx64 "\n",
+		           reinterpret_cast<uint64_t>(dst_gpu_addr), value);
+	}
 }
 
 void WriteAtEndOfPipeClockCounterWithWriteBack(uint64_t submit_id, CommandBuffer& buffer,
@@ -127,9 +134,12 @@ void WriteAtEndOfPipeClockCounterWithWriteBack(uint64_t submit_id, CommandBuffer
 	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), 0,
 	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::WriteBack);
 
-	LOGF_COLOR(Log::Color::BrightGreen,
-	           "EndOfPipe Signal!!! [0x%016" PRIx64 "] <- Clock: 0x%016" PRIx64 "\n",
-	           reinterpret_cast<uint64_t>(dst_gpu_addr), value);
+	static std::atomic<uint32_t> clock_log_count {0};
+	if (clock_log_count.fetch_add(1) < 64) {
+		LOGF_COLOR(Log::Color::BrightGreen,
+		           "EndOfPipe Signal!!! [0x%016" PRIx64 "] <- Clock: 0x%016" PRIx64 "\n",
+		           reinterpret_cast<uint64_t>(dst_gpu_addr), value);
+	}
 }
 
 void WriteAtEndOfPipeWithWriteBack64(uint64_t submit_id, CommandBuffer& buffer,

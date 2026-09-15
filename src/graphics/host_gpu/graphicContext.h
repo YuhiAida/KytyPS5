@@ -6,6 +6,8 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <atomic>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <tuple>
@@ -96,8 +98,13 @@ struct GraphicContext {
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
+	[[nodiscard]] uint64_t GetDeviceLocalHeapSize() const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
+
+	// Invoked when a device-local allocation fails, before the allocator falls back to system
+	// memory: lets the caches release VRAM and keeps the resident set on the device.
+	void SetMemoryPressureHandler(std::function<void()> handler);
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;
@@ -110,6 +117,7 @@ private:
 	                            vk::ImageCreateFlags>,
 	                 std::pair<vk::Result, vk::ImageFormatProperties>>
 	    m_image_format_properties;
+	std::function<void()> m_memory_pressure_handler;
 };
 
 struct VulkanImageState {
