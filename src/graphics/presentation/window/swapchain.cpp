@@ -14,9 +14,14 @@
 #include "graphics/presentation/window/windowInternal.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -288,6 +293,10 @@ public:
 	                                           bool draw_system_overlay);
 	uint64_t             Submit(CommandScheduler& scheduler);
 	[[nodiscard]] Status Present();
+	// Screenshot support (KYTY_PRESENT_DUMP=<dir>): the presented frame is copied into a host
+	// buffer inside the present command buffer and written out once its tick has retired. This is
+	// independent of the compositor, so it also works on Wayland.
+	void FlushPresentDump(CommandScheduler& scheduler);
 
 	[[nodiscard]] uint32_t ImageCount() const noexcept {
 		return static_cast<uint32_t>(m_images.size());
@@ -296,6 +305,16 @@ public:
 
 private:
 	void Destroy();
+	// Records the copy of the presented image into a freshly allocated host buffer (if the dump
+	// schedule asks for it) and arms m_pending_dump for FlushPresentDump.
+	void RecordPresentDump(CommandBuffer& command);
+
+	struct PendingDump {
+		VkBuffer      buffer   = VK_NULL_HANDLE;
+		VmaAllocation memory   = nullptr;
+		uint64_t      tick     = 0;
+		std::filesystem::path path;
+	};
 
 	WindowContext&              m_window;
 	vk::SwapchainKHR            m_handle = nullptr;
@@ -306,6 +325,7 @@ private:
 	std::vector<vk::Semaphore>  m_image_acquired;
 	std::vector<vk::Semaphore>  m_render_complete;
 	std::unique_ptr<SystemOverlay> m_system_overlay;
+	std::optional<PendingDump>     m_pending_dump;
 	uint32_t                    m_image_index = static_cast<uint32_t>(-1);
 	uint32_t                    m_frame_index = 0;
 };
@@ -324,6 +344,9 @@ struct Presenter::Impl {
 		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
 		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
 		frames.SetFormat(swapchain.Format());
+		if (std::getenv("KYTY_TRACE_LOG") != nullptr) {
+			LOGF("Recovering Vulkan swapchain: done\n");
+		}
 	}
 
 	Image& ResolveSurface(const ImageInfo& info) {
@@ -493,7 +516,13 @@ void Swapchain::Destroy() {
 
 	{
 		Common::LockGuard queue_lock(graphics.queue_mutex);
+		if (std::getenv("KYTY_TRACE_LOG") != nullptr) {
+			LOGF("Swapchain: destroy waitIdle begin\n");
+		}
 		RequireVulkanSuccess(graphics.queue.waitIdle(), "wait for swapchain queue");
+		if (std::getenv("KYTY_TRACE_LOG") != nullptr) {
+			LOGF("Swapchain: destroy waitIdle end\n");
+		}
 	}
 	if (m_system_overlay != nullptr) {
 		m_system_overlay->ReleaseVulkan();
@@ -527,6 +556,11 @@ void Swapchain::Destroy() {
 	m_image_views.clear();
 	m_image_acquired.clear();
 	m_render_complete.clear();
+	if (m_pending_dump.has_value()) {
+		const auto allocator = graphics.allocator;
+		vmaDestroyBuffer(allocator, m_pending_dump->buffer, m_pending_dump->memory);
+		m_pending_dump.reset();
+	}
 }
 
 void Swapchain::Recreate(bool surface_lost) {
@@ -547,11 +581,18 @@ void Swapchain::Recreate(bool surface_lost) {
 Swapchain::Status Swapchain::AcquireNextImage() {
 	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
 	m_image_index     = static_cast<uint32_t>(-1);
+	if (std::getenv("KYTY_TRACE_LOG") != nullptr) {
+		LOGF("Swapchain: acquire frame=%u\n", m_frame_index);
+	}
 	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
 	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
 	    &m_image_index);
 	switch (result) {
-		case vk::Result::eSuccess: break;
+		case vk::Result::eSuccess:
+			if (std::getenv("KYTY_TRACE_LOG") != nullptr) {
+				LOGF("Swapchain: acquire ok image=%u\n", m_image_index);
+			}
+			break;
 		case vk::Result::eSuboptimalKHR:
 			LOGF("vkAcquireNextImageKHR returned vk::Result::eSuboptimalKHR\n");
 			return Status::Recreate;
@@ -623,6 +664,10 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, 1, &region,
 	                     vk::Filter::eLinear);
 
+	// Screenshot: the presented frame is still ours at this point (TransferDstOptimal), so the
+	// dump copy can be recorded here without racing the presentation engine.
+	RecordPresentDump(command);
+
 	vk::ImageMemoryBarrier to_present {};
 	to_present.sType         = vk::StructureType::eImageMemoryBarrier;
 	to_present.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -658,12 +703,174 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	}
 }
 
+namespace {
+
+// Present-frame dump: the presented frame is written as a binary PPM (P6); the screenshot harness
+// converts it to PNG with ImageMagick. Pixel-exact and compositor independent, unlike desktop
+// capture (Wayland does not allow capturing a background window).
+void WritePresentPpm(const std::filesystem::path& path, uint32_t width, uint32_t height,
+                     vk::Format format, const uint8_t* pixels) {
+	std::error_code error;
+	std::filesystem::create_directories(path.parent_path(), error);
+	std::ofstream file(path, std::ios::binary | std::ios::trunc);
+	if (!file) {
+		LOGF("Swapchain: cannot open present dump '%s'\n", path.string().c_str());
+		return;
+	}
+	file << "P6\n" << width << ' ' << height << "\n255\n";
+	const bool swap_red_blue = format == vk::Format::eB8G8R8A8Srgb ||
+	                           format == vk::Format::eB8G8R8A8Unorm ||
+	                           format == vk::Format::eB8G8R8A8Snorm;
+	const auto texels = static_cast<size_t>(width) * height;
+	std::vector<uint8_t> rgb(texels * 3);
+	for (size_t index = 0; index < texels; index++) {
+		const auto* pixel  = pixels + index * 4;
+		rgb[index * 3 + 0] = swap_red_blue ? pixel[2] : pixel[0];
+		rgb[index * 3 + 1] = pixel[1];
+		rgb[index * 3 + 2] = swap_red_blue ? pixel[0] : pixel[2];
+	}
+	file.write(reinterpret_cast<const char*>(rgb.data()),
+	           static_cast<std::streamsize>(rgb.size()));
+}
+
+} // namespace
+
+void Swapchain::RecordPresentDump(CommandBuffer& command) {
+	static const std::filesystem::path dump_dir = [] {
+		const char* env = std::getenv("KYTY_PRESENT_DUMP");
+		return env != nullptr ? std::filesystem::path(env) : std::filesystem::path {};
+	}();
+	if (dump_dir.empty() || m_pending_dump.has_value() || m_image_index >= m_images.size() ||
+	    m_extent.width == 0 || m_extent.height == 0) {
+		return;
+	}
+	static const double interval_seconds = [] {
+		const char* env = std::getenv("KYTY_PRESENT_DUMP_INTERVAL");
+		return env != nullptr ? std::strtod(env, nullptr) : 5.0;
+	}();
+	static const uint32_t max_dumps = [] {
+		const char* env = std::getenv("KYTY_PRESENT_DUMP_MAX");
+		return env != nullptr ? static_cast<uint32_t>(std::strtoul(env, nullptr, 10)) : 64u;
+	}();
+	static const auto   start      = std::chrono::steady_clock::now();
+	static auto         last       = start;
+	static uint32_t     dump_count = 0;
+	const auto          now        = std::chrono::steady_clock::now();
+	if (dump_count >= max_dumps ||
+	    (dump_count != 0 && std::chrono::duration<double>(now - last).count() < interval_seconds)) {
+		return;
+	}
+	last = now;
+
+	auto&       graphics  = m_window.graphic_ctx;
+	const auto  allocator = graphics.allocator;
+	const auto  buffer_size = static_cast<uint64_t>(m_extent.width) * m_extent.height * 4;
+
+	vk::BufferCreateInfo create {};
+	create.size  = buffer_size;
+	create.usage = vk::BufferUsageFlagBits::eTransferDst;
+	VmaAllocationCreateInfo allocation {};
+	allocation.usage = VMA_MEMORY_USAGE_AUTO;
+	allocation.flags =
+	    VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+	VkBuffer          buffer = VK_NULL_HANDLE;
+	VmaAllocation     memory = nullptr;
+	const auto        result = static_cast<vk::Result>(vmaCreateBuffer(
+	    allocator, reinterpret_cast<const VkBufferCreateInfo*>(&create), &allocation, &buffer,
+	    &memory, nullptr));
+	if (result != vk::Result::eSuccess) {
+		LOGF("Swapchain: present dump buffer allocation failed\n");
+		return;
+	}
+
+	vk::ImageMemoryBarrier barrier {};
+	barrier.image                           = m_images[m_image_index];
+	barrier.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
+	barrier.subresourceRange.aspectMask     = vk::ImageAspectFlagBits::eColor;
+	barrier.subresourceRange.baseMipLevel   = 0;
+	barrier.subresourceRange.levelCount     = 1;
+	barrier.subresourceRange.baseArrayLayer = 0;
+	barrier.subresourceRange.layerCount     = 1;
+	barrier.oldLayout                       = vk::ImageLayout::eTransferDstOptimal;
+	barrier.newLayout                       = vk::ImageLayout::eTransferSrcOptimal;
+	barrier.srcAccessMask                   = vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask                   = vk::AccessFlagBits::eTransferRead;
+	auto vk_command = command.Handle();
+	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
+	                           nullptr, 0, nullptr, 1, &barrier);
+
+	vk::BufferImageCopy copy {};
+	copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+	copy.imageSubresource.layerCount = 1;
+	copy.imageExtent                 = {m_extent.width, m_extent.height, 1};
+	vk_command.copyImageToBuffer(m_images[m_image_index], vk::ImageLayout::eTransferSrcOptimal,
+	                             buffer, 1, &copy);
+
+	barrier.oldLayout     = vk::ImageLayout::eTransferSrcOptimal;
+	barrier.newLayout     = vk::ImageLayout::eTransferDstOptimal;
+	barrier.srcAccessMask = vk::AccessFlagBits::eTransferRead;
+	barrier.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
+	                           nullptr, 0, nullptr, 1, &barrier);
+
+	dump_count++;
+	const auto elapsed_ms = static_cast<uint64_t>(
+	    std::chrono::duration<double, std::milli>(now - start).count());
+	PendingDump pending;
+	pending.buffer = buffer;
+	pending.memory = memory;
+	pending.path = dump_dir / std::filesystem::path(
+	                                std::to_string(elapsed_ms) + "ms_" +
+	                                std::to_string(m_extent.width) + "x" +
+	                                std::to_string(m_extent.height) + ".ppm");
+	m_pending_dump = pending;
+	if (std::getenv("KYTY_RENDER_SCALE_LOG") != nullptr) {
+		LOGF("Swapchain: present dump scheduled at %llums (%ux%u)\n",
+		     static_cast<unsigned long long>(elapsed_ms), m_extent.width, m_extent.height);
+	}
+}
+
+void Swapchain::FlushPresentDump(CommandScheduler& scheduler) {
+	if (!m_pending_dump.has_value() || m_pending_dump->tick == 0) {
+		return;
+	}
+	// The copy was recorded in the present command buffer, so its tick retires with the frame;
+	// waiting here costs at most the frame that is already in flight.
+	scheduler.Wait(m_pending_dump->tick);
+	const auto pending   = *m_pending_dump;
+	const auto allocator = m_window.graphic_ctx.allocator;
+	m_pending_dump.reset();
+
+	void* mapped = nullptr;
+	if (vmaMapMemory(allocator, pending.memory, &mapped) != VK_SUCCESS || mapped == nullptr) {
+		LOGF("Swapchain: cannot map present dump buffer\n");
+	} else {
+		vmaInvalidateAllocation(allocator, pending.memory, 0, VK_WHOLE_SIZE);
+		WritePresentPpm(pending.path, m_extent.width, m_extent.height, m_format,
+		                static_cast<const uint8_t*>(mapped));
+		vmaUnmapMemory(allocator, pending.memory);
+	}
+	vmaDestroyBuffer(allocator, pending.buffer, pending.memory);
+}
+
 uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
 	EXIT_IF(m_frame_index >= m_image_acquired.size() || m_image_index >= m_render_complete.size());
 	SubmitInfo submit;
 	submit.AddWait(m_image_acquired[m_frame_index], 1, vk::PipelineStageFlagBits::eTransfer);
 	submit.AddSignal(m_render_complete[m_image_index]);
-	return scheduler.Submit(submit);
+	const auto tick = scheduler.Submit(submit);
+	if (m_pending_dump.has_value()) {
+		m_pending_dump->tick = tick;
+	}
+	if (std::getenv("KYTY_TRACE_LOG") != nullptr) {
+		LOGF("Swapchain: submit tick=%llu frame=%u image=%u sched=%p\n",
+		     static_cast<unsigned long long>(tick), m_frame_index, m_image_index,
+		     static_cast<const void*>(&scheduler));
+	}
+	return tick;
 }
 
 Swapchain::Status Swapchain::Present() {
@@ -683,7 +890,11 @@ Swapchain::Status Swapchain::Present() {
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
 	}
 	switch (result) {
-		case vk::Result::eSuccess: break;
+		case vk::Result::eSuccess:
+			if (std::getenv("KYTY_TRACE_LOG") != nullptr) {
+				LOGF("Swapchain: present ok image=%u\n", m_image_index);
+			}
+			break;
 		case vk::Result::eSuboptimalKHR:
 			LOGF("vkQueuePresentKHR returned vk::Result::eSuboptimalKHR\n");
 			return Status::Recreate;
@@ -792,6 +1003,8 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		m_impl->presented_overlay_revision.store(overlay_visual.revision,
 		                                         std::memory_order_release);
 		m_impl->window.UpdateTitle();
+		// Write out the screenshot the frame just recorded, now that its tick is retiring.
+		swapchain.FlushPresentDump(m_impl->present_scheduler);
 		m_impl->frames.Release(&frame, true);
 		return;
 	}
