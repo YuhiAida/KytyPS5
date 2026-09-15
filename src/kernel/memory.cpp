@@ -85,12 +85,24 @@ static void MapGpuRange(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return;
 	}
+	if (std::getenv("KYTY_MEM_LOG") != nullptr) {
+		static std::atomic<uint32_t> map_log_count {0};
+		if (map_log_count.fetch_add(1, std::memory_order_relaxed) < 2048) {
+			LOGF("MemMap: +0x%016" PRIx64 " size=0x%016" PRIx64 "\n", vaddr, size);
+		}
+	}
 	GetGpuResources().MapMemory(vaddr, size);
 }
 
 static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return;
+	}
+	if (std::getenv("KYTY_MEM_LOG") != nullptr) {
+		static std::atomic<uint32_t> unmap_log_count {0};
+		if (unmap_log_count.fetch_add(1, std::memory_order_relaxed) < 2048) {
+			LOGF("MemMap: -0x%016" PRIx64 " size=0x%016" PRIx64 "\n", vaddr, size);
+		}
 	}
 	GetGpuResources().UnmapMemory(vaddr, size);
 }

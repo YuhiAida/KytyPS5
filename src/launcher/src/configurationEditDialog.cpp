@@ -168,6 +168,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->lineEdit_user_name->setText(info.user_name);
 	m_ui->spinBox_user_id->setValue(info.user_id);
 	ListInit(m_ui->comboBox_screen_resolution, info.screen_resolution);
+	ListInit(m_ui->comboBox_render_scale, info.render_scale);
 	ListInit(m_ui->comboBox_present_mode, info.present_mode);
 	m_ui->comboBox_gpu->clear();
 	m_ui->comboBox_gpu->addItem(tr("Auto"));
@@ -187,7 +188,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 #endif
 	QVulkanInstance instance;
 	instance.setApiVersion(QVersionNumber(1, 3, 0));
-#if !defined(__APPLE__)
+#if !defined(__APPLE__) && QT_VERSION >= QT_VERSION_CHECK(6, 6, 0)
 	instance.setFlags(QVulkanInstance::NoPortabilityDrivers);
 #endif
 	if (instance.create()) {
@@ -342,6 +343,8 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
 	info.user_id   = ui.spinBox_user_id->value();
 	info.screen_resolution =
 	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());
+	info.render_scale =
+	    TextToEnum<Configuration::RenderScale>(ui.comboBox_render_scale->currentText());
 	info.present_mode =
 	    TextToEnum<Configuration::PresentMode>(ui.comboBox_present_mode->currentText());
 	info.gpu_index                 = ui.comboBox_gpu->currentIndex() - 1;
