@@ -68,6 +68,9 @@ public:
 
 	// Host render scale: "100" is native, the others render at a fraction of the guest extent and
 	// "Auto" matches the window resolution (only surfaces larger than the window shrink).
+	// Native is the default on purpose: scaled host backings still corrupt scene content (menu and
+	// in-game geometry grey out, iteration 42/50 in the journal), so scaling has to be an explicit
+	// choice per game until the size-carrying paths are audited.
 	enum class RenderScale { R100, R75, R50, Auto };
 	Q_ENUM(RenderScale)
 
@@ -90,7 +93,7 @@ public:
 	QString    game_comment;
 
 	Resolution             screen_resolution           = Resolution::R1280X720;
-	RenderScale            render_scale                = RenderScale::Auto;
+	RenderScale            render_scale                = RenderScale::R100;
 	QString                user_name                   = "Kyty";
 	int                    user_id                     = Config::DEFAULT_USER_ID;
 	PresentMode            present_mode                = PresentMode::Mailbox;
@@ -200,9 +203,9 @@ public:
 		KYTY_CFG_GET(screen_resolution);
 		KYTY_CFG_GET(render_scale);
 		if (!s->contains("render_scale") || EnumToText(render_scale).isEmpty()) {
-			// The key is new: configurations written before it start at "Auto", which only scales
-			// surfaces larger than the window (a 4K guest on a 720p window today).
-			render_scale = RenderScale::Auto;
+			// Missing or unknown key: native, like the code default. Scaled rendering is opt-in until
+			// the scaled-backing content bug is fixed (see the enum comment above).
+			render_scale = RenderScale::R100;
 		}
 		user_name          = s->value("user_name", user_name).toString();
 		bool user_id_ok    = false;

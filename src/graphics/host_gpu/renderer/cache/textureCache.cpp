@@ -406,14 +406,15 @@ float WantedRenderScale(GraphicContext& graphics, TextureCache::BindingType type
 		return 1.0f;
 	}
 	// Diagnostic escape hatches: ALL/CATS override the default categories to measure where the
-	// frame time goes. Defaults are "rt" (render/depth targets) and "tex" (sampled textures),
-	// which is what the measurements showed pays off - the guest renders 4K surfaces into a
-	// 1280x720 window. "sto" (storage images, whose compute dispatch dimensions are not scaled
-	// by extent alone) and "vo" (video-out surfaces) stay off unless asked for; CATS narrows to
-	// a comma-separated subset of the four.
+	// frame time goes. The default is "rt" (render/depth targets) only: scaling sampled textures
+	// ("tex") is measured to pay off - the guest renders 4K surfaces into a 1280x720 window - but
+	// scaled host backings still corrupt scene content, so nothing beyond the historically verified
+	// default is enabled without asking. "sto" (storage images, whose compute dispatch dimensions
+	// are not scaled by extent alone) and "vo" (video-out surfaces) stay off; CATS narrows to a
+	// comma-separated subset of the four.
 	const bool all = std::getenv("KYTY_RENDER_SCALE_ALL") != nullptr;
 	bool       rt  = true;
-	bool       tex = true;
+	bool       tex = false;
 	bool       sto = all;
 	bool       vo  = all;
 	if (const char* cats = std::getenv("KYTY_RENDER_SCALE_CATS")) {

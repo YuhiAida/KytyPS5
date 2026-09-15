@@ -156,7 +156,7 @@
         </item>
         <item row="7" column="1">
          <widget class="QComboBox" name="comboBox_render_scale">
-          <property name="toolTip"><string>Resolution the emulator renders at: "auto" matches the window, "100" is native (no scaling)</string></property>
+          <property name="toolTip"><string>Resolution the emulator renders at: "auto" matches the window, "100" is native (no scaling). Scaling is experimental - it currently corrupts some scene content, so leave it at 100 if you see grey or missing geometry.</string></property>
          </widget>
         </item>
        </layout>
