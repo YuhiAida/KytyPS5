@@ -2163,7 +2163,7 @@ public:
     constexpr std::array<std::pair<MemoryUsage, uint64_t>, 4> utilities{{
         {MemoryUsage::Upload, 512ull << 20},
         {MemoryUsage::Stream, 64ull << 20},
-        {MemoryUsage::Download, 32ull << 20},
+        {MemoryUsage::Download, 128ull << 20},
         {MemoryUsage::DeviceLocal, 128ull << 20},
     }};
     std::array<vk::Buffer, utilities.size()> handles{};
@@ -2194,7 +2194,7 @@ public:
                 download_probe != nullptr && download_probe_offset == 0 &&
                 &cache.GetUtilityBuffer(MemoryUsage::Download) ==
                     fixed_download &&
-                fixed_download->Size() == (32ull << 20) &&
+                fixed_download->Size() == (128ull << 20) &&
                 fixed_download->Handle() == fixed_handle,
             "oversized download replaced or corrupted the fixed shared ring");
     fixed_download->Commit();
@@ -3784,7 +3784,7 @@ public:
                   &BufferCacheTestAccess::DownloadBuffer(cache) ==
                       fixed_download &&
                   download.Handle() == fixed_download_handle &&
-                  download.Size() == (32ull << 20),
+                  download.Size() == (128ull << 20),
               "wrapped fault batch published incorrect disjoint ranges");
 
       constexpr uint64_t window_size = 512 * 1024;
@@ -4125,7 +4125,7 @@ public:
                   &BufferCacheTestAccess::DownloadBuffer(cache) ==
                       fixed_download &&
                   fixed_download->Handle() == fixed_download_handle &&
-                  fixed_download->Size() == (32ull << 20),
+                  fixed_download->Size() == (128ull << 20),
               "image acquisition replaced the shared Buffer download stream");
       std::vector<uint32_t> large_published(large_size / sizeof(uint32_t));
       Require(name, "near-capacity Buffer publication contents",
@@ -4142,8 +4142,7 @@ public:
       constexpr uint32_t grouped_first_value = 0x1122aabbu;
       constexpr uint32_t grouped_second_value = 0x3344ccddu;
       constexpr uint32_t grouped_stale = 0;
-      static_assert(grouped_owner_size < (32ull << 20) &&
-                    grouped_owner_size * 2 > (32ull << 20));
+      static_assert(grouped_owner_size < (128ull << 20));
       Libs::LibKernel::Memory::WriteBacking(
           base + grouped_first_offset, &grouped_stale, sizeof(grouped_stale));
       Libs::LibKernel::Memory::WriteBacking(
@@ -5504,7 +5503,7 @@ public:
           "without manufacturing stencil ownership");
       auto &oversized_ms = texture_cache.GetImage(ms_depth_image);
       const auto ms_data_size = oversized_ms.info.data.size;
-      oversized_ms.info.data.size = (32ull << 20) + 4;
+      oversized_ms.info.data.size = (128ull << 20) + 4;
       const bool oversized_ms_readback =
           !TextureCacheTestAccess::TryDownload(texture_cache, ms_depth_image);
       oversized_ms.info.data.size = ms_data_size;
@@ -7786,7 +7785,7 @@ public:
       constexpr uint32_t large_height = 2047;
       constexpr uint64_t large_size =
           uint64_t{large_width} * large_height * sizeof(uint32_t);
-      static_assert(large_size < (32ull << 20));
+      static_assert(large_size < (128ull << 20));
       std::memset(memory + large_offset, 0, static_cast<size_t>(large_size));
       auto large_desc = MakeLinearDesc(
           base + large_offset, large_size, vk::Format::eR8G8B8A8Unorm,

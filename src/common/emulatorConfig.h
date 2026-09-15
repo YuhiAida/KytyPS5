@@ -54,6 +54,9 @@ struct ConfigOptions {
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
+	// Render at this fraction of the guest resolution; 1.0 keeps native extents, 0.0 picks
+	// the scale that matches the window size.
+	float                  render_scale                = 1.0F;
 	bool                   command_buffer_dump_enabled = false;
 	std::filesystem::path  command_buffer_dump_folder  = "_Buffers";
 	bool                   graphics_debug_dump_enabled = false;
@@ -75,6 +78,7 @@ void Load(const ConfigOptions& cfg);
 
 uint32_t GetScreenWidth();
 uint32_t GetScreenHeight();
+float    GetRenderScale();
 const std::string& GetUserName();
 int32_t  GetUserId();
 PresentMode GetPresentMode();

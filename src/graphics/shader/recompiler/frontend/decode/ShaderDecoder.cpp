@@ -144,6 +144,7 @@ std::string FormatMimg(const Instruction& inst) {
 	}
 	switch (inst.opcode) {
 		case Opcode::IMAGE_SAMPLE:
+		case Opcode::IMAGE_GATHER4_L:
 		case Opcode::IMAGE_GATHER4_LZ:
 		case Opcode::IMAGE_GATHER4_C:
 		case Opcode::IMAGE_GATHER4_C_LZ:
@@ -246,6 +247,11 @@ void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
 		DecodeVectorGpr(code - 256u, operand);
 		return;
 	}
+	if (code >= 108u && code <= 123u) {
+		operand.kind = OperandKind::Sgpr;
+		operand.reg  = code;
+		return;
+	}
 
 	switch (code) {
 		case 106u: operand.kind = OperandKind::VccLo; return;
@@ -271,6 +277,11 @@ void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand) {
 	operand = {};
 
 	if (code <= 105u) {
+		operand.kind = OperandKind::Sgpr;
+		operand.reg  = code;
+		return;
+	}
+	if (code >= 108u && code <= 123u) {
 		operand.kind = OperandKind::Sgpr;
 		operand.reg  = code;
 		return;
@@ -388,14 +399,18 @@ Program DecodeFrontProgram(std::span<const uint32_t> front) {
 		auto& inst = result.instructions.emplace_back();
 		DecodeInstruction(front, front_words, inst);
 		front_words += inst.word_count;
-		if (inst.opcode == Opcode::S_SETPC_B64) {
+		// The merged-stage ABI hands the back shader over in s[6:7]; depending on the
+		// compiler this is s_setpc_b64 s[6:7] or s_swappc_b64 null, s[6:7]. Both end the
+		// front program - only stopping on s_setpc walks into the words that follow it.
+		if (inst.opcode == Opcode::S_SETPC_B64 || inst.opcode == Opcode::S_SWAPPC_B64) {
 			EXIT_NOT_IMPLEMENTED(inst.src0.kind != OperandKind::Sgpr || inst.src0.reg != 6u);
 			break;
 		}
 		EXIT_NOT_IMPLEMENTED(inst.opcode == Opcode::S_ENDPGM);
 	}
 	EXIT_IF(result.instructions.empty() ||
-	        result.instructions.back().opcode != Opcode::S_SETPC_B64);
+	        (result.instructions.back().opcode != Opcode::S_SETPC_B64 &&
+	         result.instructions.back().opcode != Opcode::S_SWAPPC_B64));
 	result.code = front.first(front_words);
 	return result;
 }
@@ -439,7 +454,11 @@ std::string OperandToString(const Operand& operand) {
 		case OperandKind::FloatInlineConstant:
 			text = fmt::format("{:f}", std::bit_cast<float>(operand.value));
 			break;
-		case OperandKind::Sgpr: text = fmt::format("s{}", operand.reg); break;
+		case OperandKind::Sgpr:
+			text = operand.reg >= 108u && operand.reg <= 123u
+			           ? fmt::format("ttmp{}", operand.reg - 108u)
+			           : fmt::format("s{}", operand.reg);
+			break;
 		case OperandKind::Vgpr: text = fmt::format("v{}", operand.reg); break;
 		case OperandKind::VccLo: text = "vcc_lo"; break;
 		case OperandKind::VccHi: text = "vcc_hi"; break;
@@ -577,6 +596,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_LOAD_MIP:
 		case Opcode::IMAGE_GET_RESINFO:
 		case Opcode::IMAGE_GET_LOD:
+		case Opcode::IMAGE_GATHER4_L:
 		case Opcode::IMAGE_GATHER4_LZ:
 		case Opcode::IMAGE_GATHER4_C:
 		case Opcode::IMAGE_GATHER4_C_LZ:

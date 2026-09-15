@@ -10,6 +10,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/gpuPhaseStats.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
@@ -23,6 +24,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdlib>
 #include <list>
 #include <thread>
 #include <vector>
@@ -354,6 +357,38 @@ static void RemoveVideoOutEventQueue(EventQueue::KernelEqueue       eq,
 	}
 }
 
+// Opt-in present/trigger diagnostic (KYTY_PRESENT_LOG=1): counts video-out event deliveries and
+// stale (generation-skipped) registrations once per second. Distinguishes "tick loop stopped"
+// from "ticks continue but events are not delivered".
+static void PresentDiagTrigger(VideoOutEventKind kind, bool stale) {
+	static const bool enabled = std::getenv("KYTY_PRESENT_LOG") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	static std::atomic<uint64_t> vblank {0}, pre {0}, flip {0}, mode {0}, skipped {0};
+	if (stale) {
+		skipped.fetch_add(1);
+	} else {
+		switch (kind) {
+			case VideoOutEventKind::Vblank: vblank.fetch_add(1); break;
+			case VideoOutEventKind::PreVblankStart: pre.fetch_add(1); break;
+			case VideoOutEventKind::Flip: flip.fetch_add(1); break;
+			case VideoOutEventKind::OutputMode: mode.fetch_add(1); break;
+		}
+	}
+	static auto last = std::chrono::steady_clock::now();
+	const auto  now  = std::chrono::steady_clock::now();
+	if (now - last >= std::chrono::seconds(1)) {
+		LOGF("Vtrig: vblank=%llu pre=%llu flip=%llu mode=%llu stale_skip=%llu\n",
+		     static_cast<unsigned long long>(vblank.exchange(0)),
+		     static_cast<unsigned long long>(pre.exchange(0)),
+		     static_cast<unsigned long long>(flip.exchange(0)),
+		     static_cast<unsigned long long>(mode.exchange(0)),
+		     static_cast<unsigned long long>(skipped.exchange(0)));
+		last = now;
+	}
+}
+
 static void TriggerVideoOutEvents(VideoOutConfig& video_out, VideoOutEventKind kind,
                                   void* trigger_data) {
 	VideoOutEventQueues queues;
@@ -363,11 +398,15 @@ static void TriggerVideoOutEvents(VideoOutConfig& video_out, VideoOutEventKind k
 	}
 	for (const auto& registration: queues) {
 		if (!registration || registration->generation != video_out.generation) {
+			PresentDiagTrigger(kind, true);
 			continue;
 		}
 		const auto result =
 		    EventQueue::KernelTriggerEvent(registration->handle, VideoOutEventId(kind),
 		                                   EventQueue::KERNEL_EVFILT_VIDEO_OUT, trigger_data);
+		if (result == OK) {
+			PresentDiagTrigger(kind, false);
+		}
 		EXIT_NOT_IMPLEMENTED(result != OK && result != LibKernel::KERNEL_ERROR_EBADF &&
 		                     result != LibKernel::KERNEL_ERROR_ENOENT);
 	}
@@ -782,6 +821,94 @@ void VideoOutDriver::Impl::VblankEnd() {
 	}
 }
 
+// Opt-in pacing report (KYTY_FPS_LOG=1): presented flips per second plus the largest gap
+// between presents (stutter) once per second. Flips are the frames the game actually
+// completes, so this measures the guest's frame delivery rather than vblank ticks.
+static void RecordPresentedFrame() {
+	static const bool enabled = std::getenv("KYTY_FPS_LOG") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	static auto     window_start = std::chrono::steady_clock::now();
+	static auto     last         = window_start;
+	static uint64_t frames       = 0;
+	static double   max_gap_ms   = 0.0;
+	const auto      now          = std::chrono::steady_clock::now();
+	const auto      gap_ms = std::chrono::duration<double, std::milli>(now - last).count();
+	last                   = now;
+	max_gap_ms             = std::max(max_gap_ms, gap_ms);
+	frames++;
+	const auto elapsed = std::chrono::duration<double>(now - window_start).count();
+	if (elapsed >= 1.0) {
+		LOGF("Present: fps=%.1f maxgap=%.1f ms\n", static_cast<double>(frames) / elapsed,
+		     max_gap_ms);
+		using Phase      = GpuPhaseStats::Phase;
+		const auto stats = GpuPhaseStats::Take();
+		const auto per_s = [&stats, elapsed](Phase phase) { return stats.Ms(phase) / elapsed; };
+		LOGF("Present: cpu pm4=%.0f(proc=%.0f gc=%.0f flush=%.0f) readback=%.0f(n=%llu) "
+		     "flushwait=%.0f waitcur=%.0f(n=%llu) waitother=%.0f finish=%.0f ms/s\n",
+		     per_s(Phase::Submit), per_s(Phase::Pm4Process), per_s(Phase::Pm4Gc),
+		     per_s(Phase::Pm4Flush), per_s(Phase::Readback),
+		     static_cast<unsigned long long>(stats.Count(Phase::Readback)),
+		     per_s(Phase::FlushWait), per_s(Phase::GpuWaitCurrent),
+		     static_cast<unsigned long long>(stats.Count(Phase::GpuWaitCurrent)),
+		     per_s(Phase::GpuWaitOther), per_s(Phase::GpuWaitFinish));
+		LOGF("Present: draw=%.0f(pre=%.0f check=%.0f ix=%.0f state=%.0f shad=%.0f) ms/s\n",
+		     per_s(Phase::DrawTotal), per_s(Phase::DrawPre), per_s(Phase::DrawCheck),
+		     per_s(Phase::PrepIndex), per_s(Phase::PrepState), per_s(Phase::PrepShaders));
+		LOGF("Present: exec=%.0f(prep=%.0f commit=%.0f emit=%.0f) ms/s\n",
+		     per_s(Phase::ExecPrepare) + per_s(Phase::ExecCommit) + per_s(Phase::ExecEmit),
+		     per_s(Phase::ExecPrepare), per_s(Phase::ExecCommit), per_s(Phase::ExecEmit));
+		LOGF("Present: prep=%.0f(bind=%.0f vtx=%.0f rt=%.0f pipe=%.0f) ms/s\n",
+		     per_s(Phase::BindPrep) + per_s(Phase::VtxPrep) + per_s(Phase::RtPrep) +
+		         per_s(Phase::PipePrep),
+		     per_s(Phase::BindPrep), per_s(Phase::VtxPrep), per_s(Phase::RtPrep),
+		     per_s(Phase::PipePrep));
+		LOGF("Present: bind=%.0f(img=%.0f smp=%.0f find=%.0f rbuf=%.0f rimg=%.0f) ms/s\n",
+		     per_s(Phase::PbImages) + per_s(Phase::PbSamplers) + per_s(Phase::FbFind) +
+		         per_s(Phase::RbBuffers) + per_s(Phase::RbImages),
+		     per_s(Phase::PbImages), per_s(Phase::PbSamplers), per_s(Phase::FbFind),
+		     per_s(Phase::RbBuffers), per_s(Phase::RbImages));
+		LOGF("Present: shad=%.0f(vs=%.0f ps=%.0f lookup=%.0f) ms/s\n",
+		     per_s(Phase::ProgsVs) + per_s(Phase::ProgsPs) + per_s(Phase::ProgsLookup),
+		     per_s(Phase::ProgsVs), per_s(Phase::ProgsPs), per_s(Phase::ProgsLookup));
+		LOGF("Present: lookup=%.0f(key=%.0f find=%.0f matl=%.0f) ms/s\n",
+		     per_s(Phase::ProgKey) + per_s(Phase::ProgFind) + per_s(Phase::ProgMatl),
+		     per_s(Phase::ProgKey), per_s(Phase::ProgFind), per_s(Phase::ProgMatl));
+		frames       = 0;
+		max_gap_ms   = 0.0;
+		window_start = now;
+	}
+}
+
+// Opt-in present-thread tick profile (KYTY_PRESENT_LOG=1): once per second, how many loop
+// iterations completed, how many were guest-paused and how many presented a flip. If the lines
+// stop during a freeze, the thread is blocked inside a call. All values reset each second.
+static void LogPresentTick(bool guest_paused, bool presented) {
+	static const bool enabled = std::getenv("KYTY_PRESENT_LOG") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	static auto     last   = std::chrono::steady_clock::now();
+	static uint64_t ticks  = 0;
+	static uint64_t pauses = 0;
+	static uint64_t flips  = 0;
+	ticks++;
+	pauses += guest_paused ? 1 : 0;
+	flips += presented ? 1 : 0;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - last >= std::chrono::seconds(1)) {
+		LOGF("Ptick: ticks=%llu paused=%llu flips=%llu gap_ms=%.1f\n",
+		     static_cast<unsigned long long>(ticks), static_cast<unsigned long long>(pauses),
+		     static_cast<unsigned long long>(flips),
+		     std::chrono::duration<double, std::milli>(now - last).count());
+		last   = now;
+		ticks  = 0;
+		pauses = 0;
+		flips  = 0;
+	}
+}
+
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
@@ -808,6 +935,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
 				m_presenter.Present(*frame, true);
 			}
+			LogPresentTick(true, false);
 			const auto frame_end = Common::Timer::QueryPerformanceCounter();
 			total_wait +=
 			    static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
@@ -816,6 +944,9 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 		VblankBegin();
 		bool presented = m_flip_queue.Flip(0);
+		if (presented) {
+			RecordPresentedFrame();
+		}
 		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
 			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
 				m_presenter.Present(*frame, true);
@@ -851,6 +982,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 			}
 		}
 		VblankEnd();
+		LogPresentTick(false, presented);
 
 		const auto frame_end = Common::Timer::QueryPerformanceCounter();
 		total_wait += static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
@@ -1129,7 +1261,14 @@ bool FlipQueue::Flip(uint32_t micros) {
 	m_requests.front().state = RequestState::Presenting;
 	m_mutex.Unlock();
 
+	const auto present_start = std::chrono::steady_clock::now();
 	m_presenter.Present(*r.frame);
+	const auto present_ms =
+	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - present_start)
+	        .count();
+	if (present_ms >= 50.0) {
+		LOGF("Present: flip image took %.0f ms\n", present_ms);
+	}
 
 	m_mutex.Lock();
 	if (m_requests.empty() || m_requests.front().id != r.id ||

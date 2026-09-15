@@ -7,6 +7,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace Libs::Graphics {
 
@@ -28,6 +29,12 @@ void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 	EXIT_IF(m_gpu != nullptr);
 	m_video_out = video_out;
 	m_gpu       = std::make_unique<GuestGpu>(*this);
+	// Device-local allocations that fail ask the caches for a forced sweep instead of quietly
+	// spilling the resident set into system memory.
+	m_graphics.SetMemoryPressureHandler([this] {
+		m_texture_cache.RequestForcedCollection();
+		m_buffer_cache.RequestForcedCollection();
+	});
 }
 
 void RenderContext::ShutdownGpu() {
@@ -59,6 +66,15 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
 	if (!IsMapped(fault_vaddr, fault_size)) {
+		if (std::getenv("KYTY_MEM_LOG") != nullptr) {
+			static std::atomic<uint32_t> reject_log_count {0};
+			if (reject_log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+				LOGF("MemFault: reject access=%u addr=0x%016" PRIx64 " near2m=%d near64k=%d\n",
+				     static_cast<unsigned>(access), fault_vaddr,
+				     IsMapped(fault_vaddr & ~uint64_t {0x1fffff}, fault_size) ? 1 : 0,
+				     IsMapped(fault_vaddr & ~uint64_t {0xffff}, fault_size) ? 1 : 0);
+			}
+		}
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
@@ -101,8 +117,16 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	const auto unmap = [this, vaddr, size] {
 		if (m_command_scheduler.Active()) {
 			const auto tick = m_command_scheduler.CurrentTick();
+			static uint32_t trace_count = 0;
+			if (std::getenv("KYTY_TRACE_LOG") != nullptr && trace_count++ < 16) {
+				LOGF("Unmap: addr=0x%016" PRIx64 " size=0x%016" PRIx64 " tick=%llu\n", vaddr,
+				     size, static_cast<unsigned long long>(tick));
+			}
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
+			if (std::getenv("KYTY_TRACE_LOG") != nullptr && trace_count <= 16) {
+				LOGF("Unmap: finish done addr=0x%016" PRIx64 "\n", vaddr);
+			}
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
@@ -126,14 +150,14 @@ void RenderContext::PrepareBda() {
 	m_fault_process_pending = true;
 }
 
-void RenderContext::RunGarbageCollector() {
+void RenderContext::RunGarbageCollector(bool force) {
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_texture_cache.ProcessDownloadImages();
-	m_texture_cache.RunGarbageCollector();
-	m_buffer_cache.RunGarbageCollector();
+	m_texture_cache.RunGarbageCollector(force);
+	m_buffer_cache.RunGarbageCollector(force);
 }
 
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {

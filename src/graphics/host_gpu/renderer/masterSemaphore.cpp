@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 namespace Libs::Graphics {
@@ -35,7 +36,7 @@ void MasterSemaphore::Refresh() {
 	}
 }
 
-void MasterSemaphore::Wait(uint64_t tick) {
+void MasterSemaphore::Wait(uint64_t tick, const char* who) {
 	if (IsFree(tick)) {
 		return;
 	}
@@ -49,9 +50,26 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
-	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-	Refresh();
-}
+	for (;;) {
+		const auto result = m_graphics.device.waitSemaphores(&wait_info, 3'000'000'000ull);
+		if (result == vk::Result::eSuccess) {
+			break;
+		}
+		if (result == vk::Result::eTimeout) {
+			static uint32_t trace_count = 0;
+			if (trace_count++ < 32) {
+				uint64_t counter = 0;
+				m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
+				LOGF("MasterSemaphore[%p]: waiting tick=%llu current=%llu who=%s",
+				     static_cast<const void*>(this), static_cast<unsigned long long>(tick),
+				     static_cast<unsigned long long>(counter), who);
+				const auto gpu_tick = KnownGpuTick();
+				LOGF(" known=%llu\n", static_cast<unsigned long long>(gpu_tick));
+			}
+			continue;
+		}
+		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	}
+	Refresh();}
 
 } // namespace Libs::Graphics

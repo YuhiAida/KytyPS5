@@ -20,11 +20,16 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
+#include <atomic>
+#include <chrono>
+#include <cmath>
 #include <limits>
 #include <mutex>
 #include <span>
 #include <tuple>
+#include <unordered_map>
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
@@ -168,6 +173,109 @@ void NameImageBinding(GraphicContext& graphics, Image& image, vk::ImageView view
 
 } // namespace
 
+// Guest-visible texture transfers, reported once per second with KYTY_XFER_LOG=1. Large
+// upload/download volumes are the signature of cache thrash (evict + re-fetch per frame).
+namespace ExternalTransferCounters {
+static std::atomic<uint64_t> g_upload_calls {0};
+static std::atomic<uint64_t> g_upload_bytes {0};
+static std::atomic<uint64_t> g_download_calls {0};
+static std::atomic<uint64_t> g_download_bytes {0};
+
+struct UploadAddressCounter {
+	uint64_t bytes = 0;
+	uint64_t calls = 0;
+};
+static std::mutex                                         g_upload_mutex;
+static std::unordered_map<uint64_t, UploadAddressCounter> g_upload_by_address;
+static std::atomic<uint64_t>                               g_upload_cpu_ns {0};
+static std::mutex                                          g_upload_hash_mutex;
+static std::unordered_map<uint64_t, uint64_t>              g_upload_last_hash;
+static std::atomic<uint64_t>                               g_upload_same {0};
+static std::atomic<uint64_t>                               g_upload_diff {0};
+
+void UploadCpuTime(uint64_t nanoseconds) {
+	g_upload_cpu_ns.fetch_add(nanoseconds);
+}
+
+// Samples the first 4 KiB of the uploaded guest data: equal hashes for consecutive uploads of
+// the same address mean the re-upload carried unchanged content.
+void UploadContent(uint64_t address, const uint8_t* data, uint64_t size) {
+	uint64_t       hash = 1469598103934665603ull;
+	const uint64_t n    = std::min<uint64_t>(size, 4096);
+	for (uint64_t i = 0; i < n; i++) {
+		hash ^= data[i];
+		hash *= 1099511628211ull;
+	}
+	std::scoped_lock lock {g_upload_hash_mutex};
+	auto&            last = g_upload_last_hash[address];
+	if (last == hash && last != 0) {
+		g_upload_same.fetch_add(1);
+	} else {
+		g_upload_diff.fetch_add(1);
+		last = hash;
+	}
+}
+
+void Upload(uint64_t address, uint64_t bytes) {
+	g_upload_calls.fetch_add(1);
+	g_upload_bytes.fetch_add(bytes);
+	std::scoped_lock lock {g_upload_mutex};
+	auto&            counter = g_upload_by_address[address];
+	counter.bytes += bytes;
+	counter.calls++;
+}
+
+void Download(uint64_t bytes) {
+	g_download_calls.fetch_add(1);
+	g_download_bytes.fetch_add(bytes);
+}
+
+void ReportIfEnabled() {
+	static const bool enabled = std::getenv("KYTY_XFER_LOG") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	static auto last    = std::chrono::steady_clock::now();
+	const auto  now     = std::chrono::steady_clock::now();
+	const auto  elapsed = std::chrono::duration<double>(now - last).count();
+	if (elapsed < 1.0) {
+		return;
+	}
+	const auto upload_bytes   = g_upload_bytes.exchange(0);
+	const auto upload_calls   = g_upload_calls.exchange(0);
+	const auto download_bytes = g_download_bytes.exchange(0);
+	const auto download_calls = g_download_calls.exchange(0);
+	LOGF("Xfer: upload=%.1f MB/s (%llu calls) download=%.1f MB/s (%llu calls)\n",
+	     static_cast<double>(upload_bytes) / elapsed / 1048576.0,
+	     static_cast<unsigned long long>(upload_calls),
+	     static_cast<double>(download_bytes) / elapsed / 1048576.0,
+	     static_cast<unsigned long long>(download_calls));
+	{
+		const auto cpu_ms = static_cast<double>(g_upload_cpu_ns.exchange(0)) / 1.0e6;
+		LOGF("Xfer: uploadCpu=%.0f ms/s frame_same=%llu frame_new=%llu\n", cpu_ms,
+		     static_cast<unsigned long long>(g_upload_same.exchange(0)),
+		     static_cast<unsigned long long>(g_upload_diff.exchange(0)));
+	}
+	{
+		std::scoped_lock lock {g_upload_mutex};
+		std::vector<std::pair<uint64_t, UploadAddressCounter>> top {g_upload_by_address.begin(),
+		                                                            g_upload_by_address.end()};
+		g_upload_by_address.clear();
+		std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) {
+			return a.second.bytes > b.second.bytes;
+		});
+		for (size_t i = 0; i < top.size() && i < 5; i++) {
+			LOGF("Xfer:   addr=0x%016" PRIx64 " %.1f MB/s (%llu calls, avg %.1f KiB)\n",
+			     top[i].first, static_cast<double>(top[i].second.bytes) / elapsed / 1048576.0,
+			     static_cast<unsigned long long>(top[i].second.calls),
+			     static_cast<double>(top[i].second.bytes) /
+			         static_cast<double>(std::max<uint64_t>(top[i].second.calls, 1)) / 1024.0);
+		}
+	}
+	last = now;
+}
+} // namespace ExternalTransferCounters
+
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
                            PageManager& page_manager, BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
@@ -176,15 +284,25 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
-		constexpr int64_t GiB = 1024ll * 1024 * 1024;
-		const auto        budget =
-		    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-		const auto threshold = std::min<int64_t>(budget, 8 * GiB);
-		m_pressure_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
-		m_critical_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
-		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+		constexpr uint64_t GiB = 1024ull * 1024 * 1024;
+		// Desktop reserve by default; KYTY_VRAM_RESERVE_MIB overrides it for experiments.
+		uint64_t desktop_reserve = GiB + GiB / 2;
+		if (const char* reserve_mib = std::getenv("KYTY_VRAM_RESERVE_MIB")) {
+			desktop_reserve =
+			    static_cast<uint64_t>(std::strtoull(reserve_mib, nullptr, 10)) * 1024 * 1024;
+		}
+		const auto heap = m_graphics.GetDeviceLocalHeapSize();
+		auto       target = heap - std::min(desktop_reserve, heap / 4);
+		// The live system budget can be smaller than the heap (other apps); planning to fill more
+		// than that keeps the cache permanently over budget and thrashes. Target the minimum.
+		if (const auto budget = m_graphics.GetTotalMemoryBudget(); budget != 0 && budget < target) {
+			target = budget;
+		}
+		if (heap > desktop_reserve + 2 * GiB && target != 0) {
+			m_critical_gc_memory = target - target / 8;
+			m_pressure_gc_memory = target - target / 4;
+			m_trigger_gc_memory  = target - target / 2;
+		}
 	}
 }
 
@@ -251,8 +369,145 @@ bool TextureCache::SafeToDownload(const Image& image) {
 	return !m_buffer_cache.HasGpuDirtyBytes(range.address, range.size);
 }
 
-ImageId TextureCache::InsertImage(const ImageInfo& info) {
-	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+namespace {
+
+// Render scale: host backing images of render targets and sampled textures are scaled so the
+// guest renders at the emulator window resolution. Guest image metadata (layout, pitch,
+// tiling) stays untouched; only the host extent shrinks. Returns 1.0 when no scaling applies.
+//
+// Video-out surfaces are deliberately not scaled: their content is moved between guest RAM and
+// the host image with plain buffer/image copies (guest extents), which cannot rescale, and a
+// scaled backing would make those copies exceed the host extent (GPU hang). The presenter blits
+// the guest-sized video-out surface into the swapchain, which already downscales it.
+// Guest addresses that must keep their native host extent in every binding, even when their
+// binding type would scale. Video-out flip buffers are aliased across binding types and move
+// their content through guest-extent copies: scaling them yields cropped presentation and
+// stalls the guest render thread. Experimental list: KYTY_RENDER_SCALE_SKIP=0x...,0x...
+static bool IsRenderScaleSkippedAddress(uint64_t address) {
+	static const std::vector<uint64_t> skipped = [] {
+		std::vector<uint64_t> list;
+		const char*           env = std::getenv("KYTY_RENDER_SCALE_SKIP");
+		for (const char* p = env; p != nullptr && *p != '\0';) {
+			char*      end   = nullptr;
+			const auto value = std::strtoull(p, &end, 0);
+			if (end == p) {
+				break;
+			}
+			list.push_back(value);
+			p = (*end == ',') ? end + 1 : end;
+		}
+		return list;
+	}();
+	return std::find(skipped.begin(), skipped.end(), address) != skipped.end();
+}
+
+float WantedRenderScale(GraphicContext& graphics, TextureCache::BindingType type,
+                        const ImageInfo& info) {
+	if (IsRenderScaleSkippedAddress(info.data.address)) {
+		return 1.0f;
+	}
+	// Diagnostic escape hatches: ALL/CATS override the default categories to measure where the
+	// frame time goes. The default is "rt" (render/depth targets) only: scaling sampled textures
+	// ("tex") is measured to pay off - the guest renders 4K surfaces into a 1280x720 window - but
+	// scaled host backings still corrupt scene content, so nothing beyond the historically verified
+	// default is enabled without asking. "sto" (storage images, whose compute dispatch dimensions
+	// are not scaled by extent alone) and "vo" (video-out surfaces) stay off; CATS narrows to a
+	// comma-separated subset of the four.
+	const bool all = std::getenv("KYTY_RENDER_SCALE_ALL") != nullptr;
+	bool       rt  = true;
+	bool       tex = false;
+	bool       sto = all;
+	bool       vo  = all;
+	if (const char* cats = std::getenv("KYTY_RENDER_SCALE_CATS")) {
+		rt  = std::strstr(cats, "rt") != nullptr;
+		tex = std::strstr(cats, "tex") != nullptr;
+		sto = std::strstr(cats, "sto") != nullptr;
+		vo  = std::strstr(cats, "vo") != nullptr;
+	}
+	// Video-out surfaces stay native: their copies (presenter frame copy, snapshot) do not
+	// resample yet, so scaling them would hand mismatched extents to the presentation path.
+	vo = false;
+	bool wanted = false;
+	switch (type) {
+		case TextureCache::BindingType::RenderTarget:
+		case TextureCache::BindingType::DepthTarget: wanted = rt; break;
+		case TextureCache::BindingType::Texture: wanted = tex; break;
+		case TextureCache::BindingType::Storage: wanted = sto; break;
+		case TextureCache::BindingType::VideoOut: wanted = vo; break;
+	}
+	if (!wanted) {
+		return 1.0f;
+	}
+	// Resampled transfers need a blittable single-sample colour format. Depth and multisampled
+	// surfaces stay native, and so do block-compressed ones: the staging image and the scaled
+	// backing share the format and act as blit source *and* destination, so both bits are
+	// required - and the Vulkan specification only guarantees BLIT_SRC for BC formats.
+	// Measured with tools/probe-bc-blit.sh on the RTX 3060 Ti: every BC format reports
+	// optimalTilingFeatures without BLIT_DST, so scaling a compressed texture would record an
+	// invalid blit rather than a slow one. (A device that does report BLIT_DST for them would
+	// also need the resample level math to round to the 4x4 texel block first.)
+	if (info.IsBlock() || info.IsDepth() || info.samples != 1u ||
+	    info.pixel_format == vk::Format::eUndefined) {
+		return 1.0f;
+	}
+	const auto blit_features =
+	    graphics.GetFormatProperties(info.pixel_format).optimalTilingFeatures;
+	if (!static_cast<bool>(blit_features & vk::FormatFeatureFlagBits::eBlitSrc) ||
+	    !static_cast<bool>(blit_features & vk::FormatFeatureFlagBits::eBlitDst)) {
+		return 1.0f;
+	}
+	if (info.extent.width == 0 || info.extent.height == 0) {
+		return 1.0f;
+	}
+	// Scaling is opt-in: native extents unless --render-scale (or KYTY_RENDER_SCALE, which
+	// overrides it for experiments) asks for less. "auto" renders at the window resolution,
+	// which keeps the guest's 4K surfaces from filling VRAM on a 720p window. Scaled transfers
+	// resample through a guest-extent staging image, so the window size no longer has to match
+	// the guest output.
+	float scale = Config::GetRenderScale();
+	if (const char* env = std::getenv("KYTY_RENDER_SCALE")) {
+		if (std::strcmp(env, "auto") == 0) {
+			scale = 0.0f;
+		} else {
+			const float parsed = std::strtof(env, nullptr);
+			if (parsed > 0.0f && parsed <= 1.0f) {
+				scale = parsed;
+			}
+		}
+	}
+	if (scale == 0.0f) {
+		// The graphic context tracks the window that actually exists (a fullscreen or resized
+		// window updates it); the configuration only holds what startup asked for.
+		const auto width =
+		    static_cast<float>(graphics.screen_width != 0 ? graphics.screen_width
+		                                                  : Config::GetScreenWidth());
+		const auto height =
+		    static_cast<float>(graphics.screen_height != 0 ? graphics.screen_height
+		                                                   : Config::GetScreenHeight());
+		scale = std::min({1.0f, width / static_cast<float>(info.extent.width),
+		                  height / static_cast<float>(info.extent.height)});
+	}
+	return (scale > 0.0f && scale < 1.0f) ? scale : 1.0f;
+}
+
+} // namespace
+
+ImageId TextureCache::InsertImage(const ImageInfo& info, float host_scale_x, float host_scale_y) {
+	if (host_scale_x != 1.0f || host_scale_y != 1.0f) {
+		static std::atomic<uint32_t> log_count {0};
+		if (std::getenv("KYTY_RENDER_SCALE_LOG") != nullptr &&
+		    log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+			LOGF("RenderScale: guest=%ux%u host=%ux%u addr=0x%016" PRIx64 " size=0x%016" PRIx64
+			     "\n",
+			     info.extent.width, info.extent.height,
+			     static_cast<uint32_t>(std::lround(
+			         static_cast<double>(info.extent.width) * host_scale_x)),
+			     static_cast<uint32_t>(std::lround(
+			         static_cast<double>(info.extent.height) * host_scale_y)),
+			     info.data.address, info.data.size);
+		}
+	}
+	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info, host_scale_x, host_scale_y);
 	if (!info.data.Empty()) {
 		RegisterImage(id);
 	}
@@ -1020,6 +1275,7 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
 	const auto& info    = image.info;
+	ExternalTransferCounters::Upload(info.data.address, info.data.size);
 	const auto  binding = UploadBinding(image);
 	const auto  upload  = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
 		for (auto& copy: copies) {
@@ -1115,7 +1371,18 @@ void TextureCache::InitializeImage(ImageId id) {
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
+		const auto upload_start = std::chrono::steady_clock::now();
 		UploadImage(image, *source, source_offset);
+		ExternalTransferCounters::UploadCpuTime(
+		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                          std::chrono::steady_clock::now() - upload_start)
+		                          .count()));
+		if (const auto mapped = source->Mapped();
+		    !mapped.empty() && source->IsInBounds(source_offset, image.info.data.size)) {
+			ExternalTransferCounters::UploadContent(image.info.data.address,
+			                                        mapped.data() + source_offset,
+			                                        image.info.data.size);
+		}
 		image.ClearBufferModified();
 	}
 	if (image.IsCpuDirty()) {
@@ -1293,14 +1560,27 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		if (!result) {
-			result         = InsertImage(desc.info);
-			auto& inserted = m_slot_images[result];
+			const float scale = WantedRenderScale(m_graphics, desc.type, desc.info);
+			result            = InsertImage(desc.info, scale, scale);
+			auto& inserted    = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {
 				inserted.MarkBufferModified();
 			}
 		}
 		auto& image = m_slot_images[result];
+		if (image.host_scale_x == 1.0f) {
+			// A surface first materialised through a non-scalable binding keeps its native size.
+			const float wanted_scale = WantedRenderScale(m_graphics, desc.type, desc.info);
+			static std::atomic<uint32_t> log_count {0};
+			if (wanted_scale < 1.0f && std::getenv("KYTY_RENDER_SCALE_LOG") != nullptr &&
+			    log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+				LOGF("RenderScale: native surface bound (type=%u guest=%ux%u wanted=%.3f "
+				     "addr=0x%016" PRIx64 ")\n",
+				     static_cast<uint32_t>(desc.type), desc.info.extent.width,
+				     desc.info.extent.height, wanted_scale, desc.info.data.address);
+			}
+		}
 		if (desc.type == BindingType::VideoOut &&
 		    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
 			const bool guest_dirty = image.IsBufferModified() || image.IsCpuDirty();
@@ -1387,12 +1667,50 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		RefreshImage(id);
 	}
 	switch (desc.type) {
-		case BindingType::Texture: break;
+		case BindingType::Texture:
+			if (std::getenv("KYTY_BIND_LOG") != nullptr && !image.info.data.Empty()) {
+				static std::atomic<uint32_t> bind_log {0};
+				const auto fmt      = static_cast<uint32_t>(image.backing.format);
+				const bool interest = (fmt >= 131 && fmt <= 146) || image.info.extent.width >= 1024 ||
+				                      image.info.extent.height >= 1024;
+				if (interest && bind_log.fetch_add(1, std::memory_order_relaxed) < 96) {
+					LOGF("Bind: tex addr=0x%016" PRIx64 " image_fmt=%u view_fmt=%u ext=%ux%u "
+					     "mip=%u+%u/%u layer=%u+%u/%u size=0x%" PRIx64 "\n",
+					     image.info.data.address, static_cast<uint32_t>(image.backing.format),
+					     static_cast<uint32_t>(desc.view_info.format), image.info.extent.width,
+					     image.info.extent.height, desc.view_info.base_level,
+					     desc.view_info.level_count, image.info.resources.levels,
+					     desc.view_info.base_layer, desc.view_info.layer_count,
+					     image.info.resources.layers, image.info.data.size);
+				}
+			}
+			// Temporary experiment gate: re-upload the host image from guest memory on every bind, to
+			// tell a stale host image apart from a wrong upload source.
+			if (std::getenv("KYTY_FORCE_TEX_REUPLOAD") != nullptr && !image.info.data.Empty()) {
+				image.MarkBufferModified();
+				RefreshImage(id);
+			}
+			break;
 		case BindingType::Storage:
 			if (!image.info.data.Empty()) {
 				CommitGpuWrite(image);
 			}
 			TrackImageDownload(id, image);
+			if (!static_cast<bool>(image.backing.usage & vk::ImageUsageFlagBits::eStorage)) {
+				static std::atomic<uint32_t> log_count {0};
+				if (std::getenv("KYTY_STORAGE_LOG") != nullptr &&
+				    log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+					LOGF("Storage: bound without storage usage addr=0x%016" PRIx64
+					     " image_format=%u view_format=%u block=%d samples=%u extent=%ux%u "
+					     "usage=0x%x image=0x%llx\n",
+					     image.info.data.address, static_cast<uint32_t>(image.backing.format),
+					     static_cast<uint32_t>(desc.view_info.format), image.info.IsBlock() ? 1 : 0,
+					     image.info.samples, image.info.extent.width, image.info.extent.height,
+					     static_cast<uint32_t>(image.backing.usage),
+					     static_cast<unsigned long long>(
+					         reinterpret_cast<uint64_t>(static_cast<VkImage>(image.backing.image))));
+				}
+			}
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
@@ -1575,9 +1893,11 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id,
 		attachment.storeOp     = vk::AttachmentStoreOp::eStore;
 		attachment.clearValue  = clear;
 		vk::RenderingInfo rendering {};
+		// Render scale: the render area must stay inside the host backing, which can be smaller
+		// than the guest extent for scaled render targets.
 		rendering.renderArea.extent = {
-		    std::max(image.info.extent.width >> range.baseMipLevel, 1u),
-		    std::max(image.info.extent.height >> range.baseMipLevel, 1u)};
+		    std::max(image.backing.extent.width >> range.baseMipLevel, 1u),
+		    std::max(image.backing.extent.height >> range.baseMipLevel, 1u)};
 		rendering.layerCount           = range.layerCount;
 		rendering.colorAttachmentCount = 1;
 		rendering.pColorAttachments    = &attachment;
@@ -1670,6 +1990,7 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 
 void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
                                      uint64_t destination_size, ImageDownload transfer) {
+	ExternalTransferCounters::Download(destination_size);
 	if (!transfer.valid) {
 		EXIT("TextureCache: invalid image download transfer\n");
 	}
@@ -1769,7 +2090,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	return true;
 }
 
-bool TextureCache::DownloadImageMemory(ImageId id) {
+bool TextureCache::DownloadImageMemory(ImageId id, bool best_effort) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
 		return false;
@@ -1783,6 +2104,11 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	auto [mapped, offset] =
 	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
 	if (mapped == nullptr) {
+		// A collector-driven download must not fail the frame: the buffer may be
+		// busy with in-flight work or smaller than this image.
+		if (best_effort) {
+			return false;
+		}
 		EXIT("TextureCache: failed to map reusable download buffer\n");
 	}
 	download.Commit();
@@ -1930,20 +2256,44 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	}
 }
 
-void TextureCache::RunGarbageCollector() {
+void TextureCache::RequestForcedCollection() {
+	m_force_collection_requested = true;
+}
+
+void TextureCache::RunGarbageCollector(bool force) {
+	ExternalTransferCounters::ReportIfEnabled();
+	if (std::getenv("KYTY_NO_GC") != nullptr) {
+		return;
+	}
 	std::scoped_lock lock {m_lock};
+	force = force || m_force_collection_requested.exchange(false);
 	const uint64_t   tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	// Report device-heap pressure so cache eviction is visible in the log.
+	if (m_graphics.CanReportMemoryUsage() && (tick & 0x3ffu) == 0u) {
+		const auto budget = m_graphics.GetTotalMemoryBudget();
+		if (budget != 0 && m_total_used_memory * 10u > budget * 7u) {
+			LOGF("TextureCache: device heap %" PRIu64 " MiB of %" PRIu64 " MiB\n",
+			     m_total_used_memory >> 20, budget >> 20);
+		}
+	}
+	if (!force && m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
 	const auto collect = [&](bool allow_aggressive) {
-		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
-		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
-		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
+		bool           pressured  = force || m_total_used_memory >= m_pressure_gc_memory;
+		bool           aggressive =
+		    force || (allow_aggressive && m_total_used_memory >= m_critical_gc_memory);
+		// Retention ages in frames: a texture touched within this many frames stays cached.
+		// The old windows (4/16/64) evicted textures the game streams back every second,
+		// turning pressure into a re-upload storm (measured: +350 same-content uploads/s).
+		// Widening them stops actively-streamed textures from cycling through VRAM.
+		const uint64_t age =
+		    force ? 0
+		          : std::min<uint64_t>(aggressive ? 60 : pressured ? 300 : 600, tick);
+		size_t deletions = force ? 768 : aggressive ? 256 : pressured ? 64 : 32;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
@@ -1963,13 +2313,14 @@ void TextureCache::RunGarbageCollector() {
 			}
 			if (owner->IsGpuModified()) {
 				const bool safe = SafeToDownload(*owner);
-				if (safe && owner->info.IsTiled()) {
-					continue;
-				}
+				// GPU-written tiled images used to be kept forever, so the resident set
+				// could only grow until the device heap ran out. When under pressure,
+				// download them first (tiling is handled by the texture transfer) and
+				// release the VRAM; images touched by the current frame stay cached.
 				if (safe && !pressured) {
 					continue;
 				}
-				if (safe && !DownloadImageMemory(id)) {
+				if (safe && !DownloadImageMemory(id, true)) {
 					continue;
 				}
 			}
@@ -1984,8 +2335,8 @@ void TextureCache::RunGarbageCollector() {
 			}
 		}
 	};
-	collect(false);
-	if (m_total_used_memory >= m_critical_gc_memory) {
+		collect(false);
+	if (force || m_total_used_memory >= m_critical_gc_memory) {
 		collect(true);
 	}
 }

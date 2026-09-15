@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/gpuPhaseStats.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -23,7 +24,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -386,8 +389,13 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	}
 	const auto value = Sync::ReadReferenceClock();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
-	LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64 " size=%u\n",
-	     dst_address, value, num_bytes);
+	// Called on every GPU wait (hundreds per second); keep only the first few lines.
+	static std::atomic<uint32_t> clock_log_count {0};
+	if (clock_log_count.fetch_add(1) < 64) {
+		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
+		     " size=%u\n",
+		     dst_address, value, num_bytes);
+	}
 }
 
 void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,
@@ -558,9 +566,124 @@ void GuestGpu::ThreadRun(void* data) {
 	}
 }
 
+static void LogSubmissionTime(double ms);
+
+// Opt-in PM4 profile (KYTY_OPCODE_LOG=1): command volume per second plus the five most
+// expensive packet handlers, so a translation-bound frame can be attributed to opcodes.
+//
+// `ms` is *self* time: the indirect-buffer handler recurses back into ProcessPm4, so a handler's
+// elapsed time normally contains everything its nested stream did. ProcessPm4 keeps a
+// thread-local running total of nested time per level and subtracts it here, which is why the
+// reported total stays in the same order as the wall clock instead of being multiplied by the
+// nesting depth. The second count (n=%llu) is how many of the packets sat inside an indirect
+// buffer rather than in the top-level stream.
+static void RecordOpcodeTime(uint32_t opcode, uint32_t sub_code, uint32_t depth, double ms,
+                             uint64_t dwords) {
+	static const bool enabled = std::getenv("KYTY_OPCODE_LOG") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	static double   top_ms[256]     = {};
+	static uint64_t top_count[256]  = {};
+	static double   nest_ms[256]    = {};
+	static uint64_t nest_count[256] = {};
+	static double   nop_ms[256]     = {};
+	static uint64_t nop_count[256]  = {};
+	static uint64_t window_dw       = 0;
+	static uint64_t window_pkts     = 0;
+	static auto     window_start    = std::chrono::steady_clock::now();
+	if (opcode < 256) {
+		if (depth <= 1) {
+			top_ms[opcode] += ms;
+			top_count[opcode]++;
+		} else {
+			nest_ms[opcode] += ms;
+			nest_count[opcode]++;
+		}
+		if (opcode == Pm4::IT_NOP && sub_code < 256) {
+			nop_ms[sub_code] += ms;
+			nop_count[sub_code]++;
+		}
+	}
+	window_dw += dwords;
+	window_pkts++;
+	const auto now     = std::chrono::steady_clock::now();
+	const auto elapsed = std::chrono::duration<double>(now - window_start).count();
+	if (elapsed < 1.0) {
+		return;
+	}
+	const auto total_ms = [](uint32_t index) { return top_ms[index] + nest_ms[index]; };
+	int        best[5]  = {-1, -1, -1, -1, -1};
+	for (int i = 0; i < 256; i++) {
+		if (total_ms(static_cast<uint32_t>(i)) <= 0.0) {
+			continue;
+		}
+		for (int slot = 0; slot < 5; slot++) {
+			if (best[slot] < 0 || total_ms(static_cast<uint32_t>(i)) >
+			                          total_ms(static_cast<uint32_t>(best[slot]))) {
+				for (int move = 4; move > slot; move--) {
+					best[move] = best[move - 1];
+				}
+				best[slot] = i;
+				break;
+			}
+		}
+	}
+	LOGF("PM4: %.1f MB/s pkts=%llu:",
+	     static_cast<double>(window_dw) * 4.0 / elapsed / 1048576.0,
+	     static_cast<unsigned long long>(window_pkts));
+	for (int slot = 0; slot < 5; slot++) {
+		if (best[slot] >= 0) {
+			LOGF(" op%02x=%.0fms(%llu n=%llu)", best[slot],
+			     total_ms(static_cast<uint32_t>(best[slot])),
+			     static_cast<unsigned long long>(top_count[best[slot]]),
+			     static_cast<unsigned long long>(nest_count[best[slot]]));
+		}
+	}
+	// IT_NOP carries custom operations; break them down by their sub-code so the expensive
+	// custom op is identifiable.
+	int nop_best[3] = {-1, -1, -1};
+	for (int i = 0; i < 256; i++) {
+		if (nop_ms[i] <= 0.0) {
+			continue;
+		}
+		for (int slot = 0; slot < 3; slot++) {
+			if (nop_best[slot] < 0 || nop_ms[i] > nop_ms[nop_best[slot]]) {
+				for (int move = 2; move > slot; move--) {
+					nop_best[move] = nop_best[move - 1];
+				}
+				nop_best[slot] = i;
+				break;
+			}
+		}
+	}
+	for (int slot = 0; slot < 3; slot++) {
+		if (nop_best[slot] >= 0) {
+			LOGF(" nop.r%02x=%.0fms(%llu)", nop_best[slot], nop_ms[nop_best[slot]],
+			     static_cast<unsigned long long>(nop_count[nop_best[slot]]));
+		}
+	}
+	LOGF("\n");
+	for (int i = 0; i < 256; i++) {
+		top_ms[i]     = 0.0;
+		top_count[i]  = 0;
+		nest_ms[i]    = 0.0;
+		nest_count[i] = 0;
+		nop_ms[i]     = 0.0;
+		nop_count[i]  = 0;
+	}
+	window_dw    = 0;
+	window_pkts  = 0;
+	window_start = now;
+}
+
 bool GuestGpu::Process(Submission& submission) {
-	const bool first_slice = !submission.started;
-	auto& cp = GetProcessor(submission.queue_id);
+	const auto process_begin = std::chrono::steady_clock::now();
+	static uint32_t trace_count = 0;
+	if (std::getenv("KYTY_TRACE_LOG") != nullptr && trace_count++ < 64) {
+		LOGF("Gpu: process begin type=%d\n", static_cast<int>(submission.type));
+	}
+	const bool first_slice = !submission.started;	auto& cp = GetProcessor(submission.queue_id);
 
 	if (first_slice && submission.reset_processor) {
 		cp.Reset();
@@ -576,6 +699,16 @@ bool GuestGpu::Process(Submission& submission) {
 	cp.BufferInit();
 	bool complete = true;
 
+	double     process_ms = 0.0;
+	double     gc_ms      = 0.0;
+	double     flush_ms   = 0.0;
+	const auto time_call  = [](double& total, auto&& fn) {
+		const auto t0 = std::chrono::steady_clock::now();
+		fn();
+		total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+		             .count();
+	};
+
 	switch (submission.type) {
 		case SubmissionType::Graphics: {
 			bool progressed = false;
@@ -583,16 +716,20 @@ bool GuestGpu::Process(Submission& submission) {
 			for (;;) {
 				bool round_progress = false;
 				if (!submission.constant_complete) {
-					submission.constant_complete =
-					    cp.Process(submission.constant_execution, submission.constant_commands) ==
-					    Pm4ProcessResult::Complete;
+					time_call(process_ms, [&] {
+						submission.constant_complete =
+						    cp.Process(submission.constant_execution, submission.constant_commands) ==
+						    Pm4ProcessResult::Complete;
+					});
 					round_progress |= submission.constant_execution.MadeProgress();
 				}
 				cp.SetCeComplete(submission.constant_complete);
 				if (!submission.command_complete) {
-					submission.command_complete =
-					    cp.Process(submission.command_execution, submission.commands) ==
-					    Pm4ProcessResult::Complete;
+					time_call(process_ms, [&] {
+						submission.command_complete =
+						    cp.Process(submission.command_execution, submission.commands) ==
+						    Pm4ProcessResult::Complete;
+					});
 					round_progress |= submission.command_execution.MadeProgress();
 				}
 				progressed |= round_progress;
@@ -603,11 +740,11 @@ bool GuestGpu::Process(Submission& submission) {
 			}
 			if (progressed) {
 				if (complete) {
-					m_renderer.RunGarbageCollector();
+					time_call(gc_ms, [&] { m_renderer.RunGarbageCollector(); });
 				}
-				cp.BufferFlush();
+				time_call(flush_ms, [&] { cp.BufferFlush(); });
 			} else if (complete) {
-				m_renderer.RunGarbageCollector();
+				time_call(gc_ms, [&] { m_renderer.RunGarbageCollector(); });
 			}
 			break;
 		}
@@ -625,25 +762,74 @@ bool GuestGpu::Process(Submission& submission) {
 			if (first_slice) {
 				GraphicsDbgDumpDcb("cc", num_dw, buffer);
 			}
-			complete = cp.Process(submission.command_execution, submission.commands) ==
-			           Pm4ProcessResult::Complete;
+			time_call(process_ms, [&] {
+				complete = cp.Process(submission.command_execution, submission.commands) ==
+				           Pm4ProcessResult::Complete;
+			});
 			if (submission.command_execution.MadeProgress()) {
 				if (complete) {
-					m_renderer.RunGarbageCollector();
+					time_call(gc_ms, [&] { m_renderer.RunGarbageCollector(); });
 				}
-				cp.BufferFlush();
+				time_call(flush_ms, [&] { cp.BufferFlush(); });
 			} else if (complete) {
-				m_renderer.RunGarbageCollector();
+				time_call(gc_ms, [&] { m_renderer.RunGarbageCollector(); });
 			}
 			break;
 		}
 		case SubmissionType::FlipPreparation:
-			m_renderer.RunGarbageCollector();
-			cp.PrepareCpuFlip(submission.flip_request_id);
+			time_call(gc_ms, [&] { m_renderer.RunGarbageCollector(); });
+			time_call(flush_ms, [&] { cp.PrepareCpuFlip(submission.flip_request_id); });
 			break;
 	}
 
+	const auto total_ms =
+	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - process_begin)
+	        .count();
+	if (std::getenv("KYTY_NO_PM4_DRAIN") != nullptr) {
+		ProcessCommands();
+	}
+	static uint32_t trace_count_end = 0;
+	if (std::getenv("KYTY_TRACE_LOG") != nullptr && trace_count_end++ < 64) {
+		LOGF("Gpu: process end complete=%d type=%d\n", complete ? 1 : 0,
+		     static_cast<int>(submission.type));
+	}
+	LogSubmissionTime(total_ms);
+	GpuPhaseStats::Add(GpuPhaseStats::Phase::Submit, total_ms);
+	GpuPhaseStats::Add(GpuPhaseStats::Phase::Pm4Process, process_ms);
+	GpuPhaseStats::Add(GpuPhaseStats::Phase::Pm4Gc, gc_ms);
+	GpuPhaseStats::Add(GpuPhaseStats::Phase::Pm4Flush, flush_ms);
+	if (total_ms >= 100.0) {
+		LOGF("Sub: slow %.0f ms (translate=%.0f gc=%.0f flush=%.0f)\n", total_ms, process_ms, gc_ms,
+		     flush_ms);
+	}
 	return complete;
+}
+
+// Opt-in guest GPU submission profile (KYTY_SUB_LOG=1): submissions per second and the wall
+// time they occupy. Distinguishes "frames cost CPU in the command processor" from "frames
+// wait for something else".
+static void LogSubmissionTime(double ms) {
+	static const bool enabled = std::getenv("KYTY_SUB_LOG") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	static auto     window_start = std::chrono::steady_clock::now();
+	static uint64_t count       = 0;
+	static double   total_ms    = 0.0;
+	static double   max_ms      = 0.0;
+	count++;
+	total_ms = total_ms + ms;
+	max_ms   = std::max(max_ms, ms);
+	const auto now     = std::chrono::steady_clock::now();
+	const auto elapsed = std::chrono::duration<double>(now - window_start).count();
+	if (elapsed >= 1.0) {
+		LOGF("Sub: count=%llu work=%.0f ms/s max=%.0f ms\n",
+		     static_cast<unsigned long long>(count), total_ms, max_ms);
+		window_start = now;
+		count        = 0;
+		total_ms     = 0.0;
+		max_ms       = 0.0;
+	}
 }
 
 Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
@@ -693,9 +879,20 @@ void CommandProcessor::SuspendPm4() {
 	g_current_execution->m_suspended = true;
 }
 
+// Nested time accumulated by the levels below the current one; ProcessPm4 restores the parent's
+// value when it returns so self time can be computed per packet.
+static thread_local double g_pm4_child_ms = 0.0;
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
+	// Read once per run, not once per packet: std::getenv walks the environment block, and the
+	// interpreter loop runs hundreds of thousands of times per second in a heavy phase.
+	static const bool opcode_profiled = std::getenv("KYTY_OPCODE_LOG") != nullptr;
+	static const bool no_pm4_drain    = std::getenv("KYTY_NO_PM4_DRAIN") != nullptr;
+	const auto        parent_child_ms = g_pm4_child_ms;
+	double            level_ms        = 0.0;
+	g_pm4_child_ms                    = 0.0;
 	while (execution.m_buffer_stack.size() > stop_depth) {
-		if (g_gpu_state != nullptr) {
+		if (g_gpu_state != nullptr && !no_pm4_drain) {
 			g_gpu_state->ProcessCommands();
 		}
 		const auto buffer_index = execution.m_buffer_stack.size() - 1;
@@ -779,19 +976,37 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+		// The clock reads below only pay for themselves when the opcode profile is on; the whole
+		// point of this loop is that it runs for every packet the guest submits.
+		const auto child_before = g_pm4_child_ms;
+		const auto packet_begin = opcode_profiled ? std::chrono::steady_clock::now()
+		                                          : std::chrono::steady_clock::time_point {};
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		if (opcode_profiled) {
+			const auto inclusive_ms =
+			    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+			                                              packet_begin)
+			        .count();
+			const auto child_ms = g_pm4_child_ms - child_before;
+			RecordOpcodeTime(opcode, opcode == Pm4::IT_NOP ? KYTY_PM4_R(packet_header) : 0u,
+			                 static_cast<uint32_t>(execution.m_buffer_stack.size()),
+			                 inclusive_ms - child_ms, packet_dw);
+			level_ms += inclusive_ms;
+		}
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			if (execution.m_buffer_stack.size() > buffer_index + 1) {
 				execution.m_buffer_stack[buffer_index].deferred_advance_dw = packet_dw;
 			}
+			g_pm4_child_ms = parent_child_ms + level_ms;
 			return;
 		}
 		EXIT_IF(execution.m_buffer_stack.size() != buffer_index + 1);
 		execution.m_buffer_stack[buffer_index].offset_dw += packet_dw;
 		execution.m_made_progress = true;
 	}
+	g_pm4_child_ms = parent_child_ms + level_ms;
 }
 
 void CommandProcessor::SetIndexType(uint32_t index_type_and_size) {
@@ -825,8 +1040,18 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
                                       const volatile void* address, uint32_t count_in_dwords) {
-	if (wait_op != 0) {
-		BufferFlushAndWait();
+	// wait_op only needs a CPU-side drain when this packet will read a value that
+	// may still be owned by the host GPU. Predicate-disable packets have no value
+	// to read, and CPU-current predicates must not serialize the whole pipeline.
+	if (wait_op != 0 && address != nullptr) {
+		const auto vaddr = reinterpret_cast<uint64_t>(address);
+		const bool buffer_dirty =
+		    m_renderer.GetBufferCache().HasGpuDirtyBytes(vaddr, sizeof(uint64_t));
+		const bool image_dirty =
+		    m_renderer.GetTextureCache().IsRegionGpuModified(vaddr, sizeof(uint64_t));
+		if (buffer_dirty || image_dirty) {
+			BufferFlushAndWait();
+		}
 	}
 
 	(void)count_in_dwords;
@@ -889,6 +1114,39 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
+
+	// GPU-side path: never read the args on the CPU (that read page-faults into
+	// BufferCache::ReadMemory and waits for the GPU when the args page is GPU-dirty). The raw
+	// args go to vkCmdDrawIndirect / vkCmdDrawIndexedIndirect instead. Fall back to the CPU
+	// path when the setup does not fit (8-bit indices, unknown INDEX_BUFFER_SIZE, debug dumps).
+	if (!indexed && !GraphicsRunDebugDumpEnabled()) {
+		// The instance count cannot be read without the CPU read this path removes; the
+		// hardware NUM_INSTANCES register keeps the common single-instance value.
+		m_num_instances = 1;
+		DrawIndexAuto({.vertex_count       = 0,
+		               .instance_count     = 0,
+		               .first_vertex       = 0,
+		               .first_instance     = 0,
+		               .offset_source      = DrawOffsetSource::IndirectArgs,
+		               .indirect_args_addr = m_draw_indirect_args_base_addr + data_offset});
+		return;
+	}
+	if (indexed && (m_index_type_and_size == 0u || m_index_type_and_size == 1u) &&
+	    m_index_buffer_size != 0u && !GraphicsRunDebugDumpEnabled()) {
+		// The instance count cannot be read without the CPU read this path removes; the
+		// hardware NUM_INSTANCES register keeps the common single-instance value.
+		m_num_instances = 1;
+		DrawIndex({.index_count         = 0,
+		           .index_addr          = reinterpret_cast<const void*>(m_index_base_addr),
+		           .instance_count      = 0,
+		           .base_vertex         = 0,
+		           .first_instance      = 0,
+		           .offset_source       = DrawOffsetSource::IndirectArgs,
+		           .indirect_args_addr  = m_draw_indirect_args_base_addr + data_offset,
+		           .indirect_index_size = static_cast<uint64_t>(m_index_buffer_size) *
+		                                  (m_index_type_and_size == 0u ? 2u : 4u)});
+		return;
+	}
 
 	const auto* args_addr =
 	    reinterpret_cast<const void*>(m_draw_indirect_args_base_addr + data_offset);
@@ -1057,8 +1315,113 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 }
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
-                                      uint32_t thread_group_z, uint32_t mode) {
+                                      uint32_t thread_group_z, uint32_t mode,
+                                      uint64_t indirect_args_addr) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+
+	// Opt-in dispatch workload stats (KYTY_DISPATCH_LOG=1): dispatches per second, their total
+	// group count, the largest single dispatch and the most frequent compute shaders -
+	// distinguishes a heavy pipeline from a re-dispatch loop on one shader.
+	{
+		static const bool enabled = std::getenv("KYTY_DISPATCH_LOG") != nullptr;
+		static std::atomic<uint64_t> count {0};
+		static std::atomic<uint64_t> groups {0};
+		static std::atomic<uint64_t> max_groups {0};
+		static uint64_t              top_addr[64] {};
+		static uint64_t              top_count[64] {};
+		static uint64_t              top_groups[64] {};
+		if (enabled) {
+			count.fetch_add(1);
+			const auto total = static_cast<uint64_t>(std::max(thread_group_x, 1u)) *
+			                   std::max(thread_group_y, 1u) * std::max(thread_group_z, 1u);
+			groups.fetch_add(total);
+			uint64_t prev = max_groups.load();
+			while (total > prev && !max_groups.compare_exchange_weak(prev, total)) {
+			}
+			const uint64_t addr  = m_sh_ctx.GetCs().cs_regs.data_addr;
+			bool           found = false;
+			for (uint32_t i = 0; i < 64 && !found; i++) {
+				if (top_addr[i] == addr) {
+					top_count[i]++;
+					top_groups[i] += total;
+					found = true;
+				}
+			}
+			for (uint32_t i = 0; i < 64 && !found; i++) {
+				if (top_addr[i] == 0) {
+					top_addr[i]   = addr;
+					top_count[i]  = 1;
+					top_groups[i] = total;
+					found         = true;
+				}
+			}
+			static auto last = std::chrono::steady_clock::now();
+			const auto  now  = std::chrono::steady_clock::now();
+			if (now - last >= std::chrono::seconds(1)) {
+				LOGF("Dispatch: count=%llu groups=%llu max=%llu\n",
+				     static_cast<unsigned long long>(count.exchange(0)),
+				     static_cast<unsigned long long>(groups.exchange(0)),
+				     static_cast<unsigned long long>(max_groups.exchange(0)));
+				for (uint32_t rank = 0; rank < 3; rank++) {
+					uint32_t best = 64;
+					for (uint32_t i = 0; i < 64; i++) {
+						if (top_count[i] != 0 &&
+						    (best == 64 || top_count[i] > top_count[best])) {
+							best = i;
+						}
+					}
+					if (best == 64) {
+						break;
+					}
+					LOGF("Dispatch:   shader=0x%016" PRIx64 " calls=%llu groups=%llu avg_groups=%llu\n",
+					     top_addr[best], static_cast<unsigned long long>(top_count[best]),
+					     static_cast<unsigned long long>(top_groups[best]),
+					     static_cast<unsigned long long>(top_groups[best] / top_count[best]));
+					top_addr[best]   = 0;
+					top_count[best]  = 0;
+					top_groups[best] = 0;
+				}
+				for (uint32_t i = 0; i < 64; i++) {
+					top_addr[i]   = 0;
+					top_count[i]  = 0;
+					top_groups[i] = 0;
+				}
+				last = now;
+			}
+		}
+	}
+
+	// KYTY_SKIP_COMPUTE=1 (diagnostic only): drop compute dispatches entirely to measure
+	// their share of frame time. Rendered output is meaningless; fps is the signal.
+	if (std::getenv("KYTY_SKIP_COMPUTE") != nullptr) {
+		static std::atomic<uint64_t> skipped {0};
+		static auto                  last = std::chrono::steady_clock::now();
+		skipped.fetch_add(1);
+		const auto now = std::chrono::steady_clock::now();
+		if (now - last >= std::chrono::seconds(1)) {
+			LOGF("SkipCompute: %llu/s\n", static_cast<unsigned long long>(skipped.exchange(0)));
+			last = now;
+		}
+		return;
+	}
+
+	// KYTY_COMPUTE_TINY=1 (diagnostic only): keep the full translation path but run every
+	// dispatch with a 1x1x1 grid - separates per-dispatch fixed cost from thread-work cost.
+	if (std::getenv("KYTY_COMPUTE_TINY") != nullptr) {
+		static std::atomic<uint64_t> converted {0};
+		static auto                  last = std::chrono::steady_clock::now();
+		thread_group_x     = 1;
+		thread_group_y     = 1;
+		thread_group_z     = 1;
+		indirect_args_addr = 0;
+		converted.fetch_add(1);
+		const auto now = std::chrono::steady_clock::now();
+		if (now - last >= std::chrono::seconds(1)) {
+			LOGF("TinyCompute: %llu/s\n",
+			     static_cast<unsigned long long>(converted.exchange(0)));
+			last = now;
+		}
+	}
 
 	uint32_t frame_num = 0;
 	// uint32_t local_x   = 1;
@@ -1101,8 +1464,27 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			}
 		}
 
+		const auto call_begin = std::chrono::steady_clock::now();
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
-		                                              thread_group_y, thread_group_z, mode);
+		                                              thread_group_y, thread_group_z, mode,
+		                                              indirect_args_addr);
+		if (std::getenv("KYTY_COMPUTE_LOG") != nullptr) {
+			static std::atomic<uint64_t> acc_ns {0};
+			static std::atomic<uint64_t> acc_n {0};
+			static auto                  last = std::chrono::steady_clock::now();
+			acc_ns.fetch_add(static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(
+			        std::chrono::steady_clock::now() - call_begin)
+			        .count()));
+			acc_n.fetch_add(1);
+			const auto now = std::chrono::steady_clock::now();
+			if (now - last >= std::chrono::seconds(1)) {
+				LOGF("GpuCall: n=%llu total=%.0f ms/s\n",
+				     static_cast<unsigned long long>(acc_n.exchange(0)),
+				     static_cast<double>(acc_ns.exchange(0)) / 1.0e6);
+				last = now;
+			}
+		}
 	}
 
 	/*constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;
@@ -1138,8 +1520,17 @@ void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(m_dispatch_indirect_args_base_addr == 0);
 
 	const auto args_addr = m_dispatch_indirect_args_base_addr + data_offset;
-	auto*      args      = reinterpret_cast<const DispatchIndirectArgs*>(args_addr);
 
+	// GPU-side path: the args go to vkCmdDispatchIndirect; the CPU read that page-faults into
+	// BufferCache::ReadMemory and waits for the GPU is skipped. Thread-dimension remapping
+	// needs the counts, so that mode keeps the CPU path.
+	constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;
+	if ((mode & DispatchInitiatorUseThreadDimensions) == 0 && !GraphicsRunDebugDumpEnabled()) {
+		DispatchDirect(0, 0, 0, mode, args_addr);
+		return;
+	}
+
+	auto* args = reinterpret_cast<const DispatchIndirectArgs*>(args_addr);
 	DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode);
 }
 
@@ -1153,10 +1544,37 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
+	// Opt-in split of the WAIT_FLIP_DONE cost (KYTY_OPCODE_LOG=1): the flush submits the
+	// pending command stream, the wait blocks until the queued flip for this buffer is done.
+	static const bool profiled = std::getenv("KYTY_OPCODE_LOG") != nullptr;
+	const auto        start    = std::chrono::steady_clock::now();
+
 	BufferFlush();
+
+	const auto flush_done = std::chrono::steady_clock::now();
 
 	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
 	                                      static_cast<int>(display_buffer_index));
+
+	if (!profiled) {
+		return;
+	}
+	const auto   waited = std::chrono::steady_clock::now();
+	static double acc_flush_ms = 0.0;
+	static double acc_wait_ms  = 0.0;
+	static uint64_t acc_calls   = 0;
+	static auto     window      = std::chrono::steady_clock::now();
+	acc_flush_ms += std::chrono::duration<double, std::milli>(flush_done - start).count();
+	acc_wait_ms += std::chrono::duration<double, std::milli>(waited - flush_done).count();
+	acc_calls++;
+	if (std::chrono::duration<double>(waited - window).count() >= 1.0) {
+		LOGF("WaitFlipDone: calls=%llu flush=%.0fms wait=%.0fms\n",
+		     static_cast<unsigned long long>(acc_calls), acc_flush_ms, acc_wait_ms);
+		acc_flush_ms = 0.0;
+		acc_wait_ms  = 0.0;
+		acc_calls    = 0;
+		window       = waited;
+	}
 }
 
 template <typename T>

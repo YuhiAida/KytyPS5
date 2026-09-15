@@ -196,9 +196,13 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
-                                    uint32_t thread_group_z, uint32_t mode) {
+                                    uint32_t thread_group_z, uint32_t mode,
+                                    uint64_t indirect_args_addr) {
 	EXIT_IF(buffer.IsInvalid());
+	const auto compute_te0 = std::chrono::steady_clock::now();
+	const bool gpu_indirect = indirect_args_addr != 0;
 	m_context.GetCommandScheduler().PopPendingOperations();
+	const auto compute_te1 = std::chrono::steady_clock::now();
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -206,7 +210,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    thread_group_x, thread_group_y, thread_group_z, mode,
 	                    sh_ctx.GetCs().cs_regs.data_addr);
 
+	const auto        compute_tl0 = std::chrono::steady_clock::now();
 	Common::LockGuard lock(m_context.GetMutex());
+	const auto        compute_tl1 = std::chrono::steady_clock::now();
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
 		     "groups=%ux%ux%u mode=%u\n",
@@ -241,9 +247,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	ShaderComputeInputInfo input_info {};
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+	EXIT_NOT_IMPLEMENTED(gpu_indirect && use_thread_dimensions);
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
+	const bool compute_timing = std::getenv("KYTY_COMPUTE_LOG") != nullptr;
+	const auto compute_t0     = std::chrono::steady_clock::now();
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	const auto compute_t1 = std::chrono::steady_clock::now();
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -252,11 +262,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = input_info.stage.resources;
-	if (TryConsumeComputeMetaClear(input_info, buffer)) {
+	if (!gpu_indirect && TryConsumeComputeMetaClear(input_info, buffer)) {
 		ResetBindings();
 		return;
 	}
-	if (TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
+	if (!gpu_indirect &&
+	    TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
 	                                thread_group_z, mode)) {
 		ResetBindings();
 		return;
@@ -347,7 +358,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
-	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
+	if (!gpu_indirect && (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0)) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
 			LOGF("GraphicsRenderDispatchDirect: skipping zero-sized dispatch groups=%ux%ux%u "
@@ -358,9 +369,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
+	const auto compute_tm0 = std::chrono::steady_clock::now();
 	buffer.EndRendering();
+	const auto compute_t2 = std::chrono::steady_clock::now();
 	auto& pipeline =
 	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	const auto compute_t3 = std::chrono::steady_clock::now();
 	auto bindings = PrepareBindings(input_info.stage);
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
@@ -373,6 +387,19 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
+	const auto compute_t4 = std::chrono::steady_clock::now();
+	auto&      gpu_time_scheduler = m_context.GetCommandScheduler();
+	const bool gpu_time_active    = gpu_time_scheduler.GpuTimeActive();
+	if (gpu_time_active) {
+		CommandScheduler::GpuDispatchMeta gpu_time_meta {};
+		gpu_time_meta.shader_hash = program.shader_hash;
+		gpu_time_meta.group_x     = thread_group_x;
+		gpu_time_meta.group_y     = thread_group_y;
+		gpu_time_meta.group_z     = thread_group_z;
+		gpu_time_meta.mode        = mode;
+		gpu_time_meta.indirect    = gpu_indirect ? 1u : 0u;
+		gpu_time_scheduler.GpuTimeDispatchBegin(buffer, gpu_time_meta);
+	}
 	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
 	has_storage_writes =
 	    std::any_of(program.info.images.begin(), program.info.images.end(),
@@ -388,10 +415,64 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	if (gpu_indirect) {
+		// The args live in guest memory; bind them through the buffer cache (for GPU reads) and
+		// let vkCmdDispatchIndirect consume them, so no CPU read / queue wait is needed.
+		auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
+		    indirect_args_addr, sizeof(vk::DispatchIndirectCommand), false);
+		vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	} else {
+		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	}
+	if (gpu_time_active) {
+		gpu_time_scheduler.GpuTimeDispatchMid(buffer);
+	}
+	if (compute_timing) {
+		// Opt-in per-phase breakdown (KYTY_COMPUTE_LOG=1) of where a compute dispatch's CPU time
+		// goes: program lookup/compile, pipeline lookup/creation, bindings, command emission.
+		const auto compute_t5 = std::chrono::steady_clock::now();
+		static std::atomic<uint64_t> t_program {0};
+		static std::atomic<uint64_t> t_pipeline {0};
+		static std::atomic<uint64_t> t_bindings {0};
+		static std::atomic<uint64_t> t_dispatch {0};
+		static std::atomic<uint64_t> t_pop {0};
+		static std::atomic<uint64_t> t_lock {0};
+		static std::atomic<uint64_t> t_endr {0};
+		static std::atomic<uint64_t> t_count {0};
+		static auto                  last = std::chrono::steady_clock::now();
+		const auto ns = [](auto a, auto b) {
+			return static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+		};
+		t_program.fetch_add(ns(compute_t0, compute_t1));
+		t_pipeline.fetch_add(ns(compute_t2, compute_t3));
+		t_bindings.fetch_add(ns(compute_t3, compute_t4));
+		t_dispatch.fetch_add(ns(compute_t4, compute_t5));
+		t_pop.fetch_add(ns(compute_te0, compute_te1));
+		t_lock.fetch_add(ns(compute_tl0, compute_tl1));
+		t_endr.fetch_add(ns(compute_tm0, compute_t2));
+		t_count.fetch_add(1);
+		const auto now = std::chrono::steady_clock::now();
+		if (now - last >= std::chrono::seconds(1)) {
+			LOGF("Compute: n=%llu program=%.0f pipeline=%.0f bindings=%.0f dispatch=%.0f "
+			     "pop=%.0f lock=%.0f endr=%.0f ms/s\n",
+			     static_cast<unsigned long long>(t_count.exchange(0)),
+			     static_cast<double>(t_program.exchange(0)) / 1.0e6,
+			     static_cast<double>(t_pipeline.exchange(0)) / 1.0e6,
+			     static_cast<double>(t_bindings.exchange(0)) / 1.0e6,
+			     static_cast<double>(t_dispatch.exchange(0)) / 1.0e6,
+			     static_cast<double>(t_pop.exchange(0)) / 1.0e6,
+			     static_cast<double>(t_lock.exchange(0)) / 1.0e6,
+			     static_cast<double>(t_endr.exchange(0)) / 1.0e6);
+			last = now;
+		}
+	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (gpu_time_active) {
+		gpu_time_scheduler.GpuTimeDispatchEnd(buffer);
+	}
 	ResetBindings();
 }
 

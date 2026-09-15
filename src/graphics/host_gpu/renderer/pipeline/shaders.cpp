@@ -585,6 +585,26 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	AddLayoutBindings(descriptor_bindings, *input_info.stage.program,
 	                  vk::ShaderStageFlagBits::eCompute);
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
+	if (std::getenv("KYTY_PIPE_LAYOUT_LOG") != nullptr) {
+		static std::atomic<uint32_t> layout_log_count {0};
+		if (layout_log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+			std::string bindings;
+			for (const auto& binding: descriptor_bindings) {
+				bindings += " ";
+				bindings += std::to_string(binding.binding);
+				bindings += ":";
+				bindings += vk::to_string(binding.descriptorType);
+				bindings += "x";
+				bindings += std::to_string(binding.descriptorCount);
+			}
+			LOGF("PipeLayout: CS wave=%u subgroup_control=%d required=%u bindings=%s pc=%u\n",
+			     wave_size, graphics.compute_subgroup_size_control_enabled ? 1 : 0,
+			     comp_shader_stage_info.pNext != nullptr ? comp_subgroup_size.requiredSubgroupSize
+			                                             : 0u,
+			     bindings.c_str(),
+			     static_cast<uint32_t>(ShaderRecompiler::IR::NativePushConstantSize));
+		}
+	}
 	const vk::PushConstantRange push_constants {vk::ShaderStageFlagBits::eCompute, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 
@@ -610,15 +630,30 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	info.stage             = comp_shader_stage_info;
 	info.layout            = pipeline.pipeline_layout;
 	info.basePipelineIndex = -1;
+	// A single pathological compute shader (large SPIR-V from the recompiler's unoptimized IR)
+	// can make the driver spend tens of seconds in optimization. This switch compiles such
+	// pipelines without driver-side optimization to keep the frame alive.
+	if (std::getenv("KYTY_FAST_PIPE_COMPILE") != nullptr) {
+		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+	}
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
+	const auto cp_create_t0 = std::chrono::steady_clock::now();
 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                &pipeline.pipeline);
+	const auto cp_create_ms =
+	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+	                                              cp_create_t0)
+	        .count();
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
+	if (cp_create_ms >= 50.0) {
+		LOGF("PipeCreate: driver create %.0f ms cache=%p\n", cp_create_ms,
+		     static_cast<void*>(driver_cache));
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);

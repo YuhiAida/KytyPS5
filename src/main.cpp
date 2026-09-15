@@ -56,6 +56,10 @@ static void PrintUsage() {
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
+	::printf("  --render-scale <scale>               Render at this fraction of the guest\n");
+	::printf("                                       resolution (0 < scale <= 1 or 'native'),\n");
+	::printf("                                       or 'auto' to match the window size.\n");
+	::printf("                                       Default: 1.0 (native).\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
@@ -252,6 +256,23 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			const int32_t vblank_frequency = Common::ToInt32(value);
 			options.config.vblank_frequency =
 			    static_cast<uint32_t>(vblank_frequency < 0 ? 0 : vblank_frequency);
+		} else if (arg == "--render-scale") {
+			if (value == "auto") {
+				// Auto matches the window resolution (0 is the sentinel for it).
+				options.config.render_scale = 0.0F;
+			} else if (value == "native" || value == "off") {
+				options.config.render_scale = 1.0F;
+			} else {
+				char*       end   = nullptr;
+				const float scale = std::strtof(value.c_str(), &end);
+				if (end == value.c_str() || *end != '\0' || scale <= 0.0F || scale > 1.0F) {
+					::printf(
+					    "invalid render scale: %s (expected 'auto', 'native', or 0 < scale <= 1)\n",
+					    value.c_str());
+					return false;
+				}
+				options.config.render_scale = scale;
+			}
 		} else if (arg == "--console-language") {
 			if (!ParseConsoleLanguage(value, options.config.console_language)) {
 				::printf("invalid console language: %s\n", value.c_str());

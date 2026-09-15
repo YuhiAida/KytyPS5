@@ -149,6 +149,16 @@
           <property name="text"><string>Enable readback</string></property>
          </widget>
         </item>
+        <item row="7" column="0">
+         <widget class="QLabel" name="label_render_scale">
+          <property name="text"><string>Render scale:</string></property>
+         </widget>
+        </item>
+        <item row="7" column="1">
+         <widget class="QComboBox" name="comboBox_render_scale">
+          <property name="toolTip"><string>Resolution the emulator renders at: "auto" matches the window, "100" is native (no scaling). Scaling is experimental - it currently corrupts some scene content, so leave it at 100 if you see grey or missing geometry.</string></property>
+         </widget>
+        </item>
        </layout>
       </widget>
      </item>
