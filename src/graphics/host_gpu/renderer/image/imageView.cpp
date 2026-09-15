@@ -4,6 +4,8 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 
+#include <cstdlib>
+
 namespace Libs::Graphics {
 
 namespace {
@@ -301,6 +303,20 @@ bool FormatsCompatible(vk::Format base, vk::Format view) noexcept {
 	}
 	const auto base_class = FormatClass(base);
 	const auto view_class = FormatClass(view);
+	// Block-compressed and plain formats share the same bytes-per-block bits (BC7 blocks and
+	// R32G32B32A32 texels are both 16 bytes), so the class bits alone would let a compressed
+	// image answer a raw integer binding and vice versa. Vulkan forbids views across that
+	// boundary: a storage view of a compressed image is invalid. The guest aliases the same
+	// memory as a raw storage image and samples it as a compressed texture, which needs two
+	// separate host images synchronized through the cache, not one reinterpreted image.
+	constexpr auto block_bits = Bc1Rgb | Bc1Rgba | Bc2 | Bc3 | Bc4 | Bc5 | Bc6h | Bc7;
+	// Temporary experiment gate: restores the pre-fix behaviour where a compressed image answered
+	// a raw binding of the same bytes-per-block. Drop it together with the alias-sync work.
+	static const bool legacy_compat = std::getenv("KYTY_FORMAT_COMPAT_LEGACY") != nullptr;
+	if (!legacy_compat && static_cast<bool>(base_class & block_bits) !=
+	                            static_cast<bool>(view_class & block_bits)) {
+		return false;
+	}
 	return view_class != None && (base_class & view_class) == view_class;
 }
 

@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/gpuPhaseStats.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -14,7 +15,9 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -26,6 +29,65 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
+
+// Opt-in readback profile (KYTY_READBACK_LOG=1): GPU-dirty downloads and the wall time spent
+// waiting for the GPU queue inside them. KYTY_SKIP_READBACK=1 (diagnostic only) skips the
+// wait, leaving the guest copy possibly stale; used to measure the CPU-side ceiling.
+void RecordReadbackWait(double wait_ms, uint64_t vaddr, uint64_t size, bool cpu_write,
+                        uint64_t request_size) {
+	static const bool enabled = std::getenv("KYTY_READBACK_LOG") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	static auto     window_start = std::chrono::steady_clock::now();
+	static uint64_t count        = 0;
+	static uint64_t read_count   = 0;
+	static uint64_t write_count  = 0;
+	static double   total_ms     = 0.0;
+	static double   max_ms       = 0.0;
+	static uint64_t bulk_writes  = 0;
+	static uint64_t small_writes = 0;
+	static std::map<std::pair<uint64_t, uint64_t>, uint64_t> hot;
+	count++;
+	(cpu_write ? write_count : read_count)++;
+	if (cpu_write) {
+		(request_size > 64 ? bulk_writes : small_writes)++;
+	}
+	total_ms = total_ms + wait_ms;
+	max_ms   = std::max(max_ms, wait_ms);
+	hot[{vaddr, size}]++;
+	const auto now     = std::chrono::steady_clock::now();
+	const auto elapsed = std::chrono::duration<double>(now - window_start).count();
+	if (elapsed >= 1.0) {
+		LOGF("Readback: count=%llu read=%llu cpu-write=%llu (bulk=%llu small=%llu) wait=%.0f"
+		     " ms/s max=%.0f ms\n",
+		     static_cast<unsigned long long>(count), static_cast<unsigned long long>(read_count),
+		     static_cast<unsigned long long>(write_count),
+		     static_cast<unsigned long long>(bulk_writes),
+		     static_cast<unsigned long long>(small_writes), total_ms, max_ms);
+		std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> top;
+		top.reserve(hot.size());
+		for (const auto& [range, calls]: hot) {
+			top.emplace_back(calls, range);
+		}
+		std::sort(top.begin(), top.end(),
+		          [](const auto& lhs, const auto& rhs) { return lhs.first > rhs.first; });
+		for (size_t i = 0; i < std::min<size_t>(top.size(), 3); i++) {
+			LOGF("Readback hot: addr=0x%016" PRIx64 " size=0x%" PRIx64 " calls=%llu\n",
+			     top[i].second.first, top[i].second.second,
+			     static_cast<unsigned long long>(top[i].first));
+		}
+		window_start = now;
+		count        = 0;
+		read_count   = 0;
+		write_count  = 0;
+		bulk_writes  = 0;
+		small_writes = 0;
+		total_ms     = 0.0;
+		max_ms       = 0.0;
+		hot.clear();
+	}
+}
 
 } // namespace
 
@@ -129,7 +191,11 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 
 	const auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
 	if (mapped == nullptr) {
-		EXIT("BufferCache: download exceeds 32 MiB staging buffer capacity\n");
+		EXIT("BufferCache: download of %llu bytes (vaddr=0x%016" PRIx64 " size=%llu, copies=%zu)"
+		     " exceeds %llu MiB download staging buffer capacity\n",
+		     static_cast<unsigned long long>(total_size), vaddr,
+		     static_cast<unsigned long long>(size), copies.size(),
+		     static_cast<unsigned long long>(m_download_buffer.Size() / (1024u * 1024u)));
 	}
 	m_download_buffer.Commit();
 	for (auto& copy: copies) {
@@ -183,7 +249,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
-      m_download_buffer(graphics, scheduler, MemoryUsage::Download, 32 * MiB),
+      // Large enough for the biggest eviction candidates: a 4K BGRA image is ~33 MiB
+      // and could never be downloaded (and therefore never freed) with 32 MiB.
+      m_download_buffer(graphics, scheduler, MemoryUsage::Download, 128 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
@@ -250,9 +318,18 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
 
 		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
-			const auto tick = m_scheduler.CurrentTick();
-			m_scheduler.Wait(tick);
-			m_scheduler.WaitPriorityOperations(tick);
+			const auto wait_begin = std::chrono::steady_clock::now();
+			if (std::getenv("KYTY_SKIP_READBACK") == nullptr) {
+				const auto tick = m_scheduler.CurrentTick();
+				m_scheduler.Wait(tick);
+				m_scheduler.WaitPriorityOperations(tick);
+			}
+			const auto wait_ms =
+			    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+			                                              wait_begin)
+			        .count();
+			GpuPhaseStats::Add(GpuPhaseStats::Phase::Readback, wait_ms);
+			RecordReadbackWait(wait_ms, window_begin, window_end - window_begin, is_write, size);
 			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
 		}
 		if (is_write) {
@@ -578,17 +655,25 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
-void BufferCache::RunGarbageCollector() {
+void BufferCache::RequestForcedCollection() {
+	m_force_collection_requested = true;
+}
+
+void BufferCache::RunGarbageCollector(bool force) {
+	if (std::getenv("KYTY_NO_GC") != nullptr) {
+		return;
+	}
+	force           = force || m_force_collection_requested.exchange(false);
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	if (!force && m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
 
-	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
+	const bool     aggressive = force || m_total_used_memory >= m_critical_gc_memory;
+	const uint64_t age        = force ? 0 : std::min<uint64_t>(aggressive ? 80 : 160, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 
 	std::vector<BufferId> dirty_buffers;
@@ -603,7 +688,20 @@ void BufferCache::RunGarbageCollector() {
 			return false;
 		}
 		if (dirty) {
-			EXIT_IF(!DownloadBufferMemory(buffer, buffer.CpuAddress(), buffer.Size()));
+			// A failed download must not abort the emulator (forced passes run under memory
+			// pressure): keep the buffer and retry on the next collection. The download ring is
+			// smaller than the largest cached buffers, so drain the buffer in windows; each
+			// window maps at most half the ring.
+			const auto window_size = std::max<uint64_t>(m_download_buffer.Size() / 2u, 1ull << 20u);
+			bool       downloaded  = false;
+			for (uint64_t offset = 0; offset < buffer.Size(); offset += window_size) {
+				const auto window = std::min(window_size, buffer.Size() - offset);
+				downloaded |=
+				    DownloadBufferMemory(buffer, buffer.CpuAddress() + offset, window);
+			}
+			if (!downloaded) {
+				return false;
+			}
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());

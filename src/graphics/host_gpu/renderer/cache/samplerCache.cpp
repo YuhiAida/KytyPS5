@@ -70,6 +70,12 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 		min_lod = static_cast<float>(r.MinLod()) / 256.0f;
 		max_lod = static_cast<float>(r.MaxLod()) / 256.0f;
 	}
+	// Temporary experiment gate: pin sampling to the base level, to tell a wrong mip path apart
+	// from wrong base-level content.
+	if (std::getenv("KYTY_LOD0") != nullptr) {
+		min_lod = 0.0f;
+		max_lod = 0.0f;
+	}
 
 	vk::SamplerCreateInfo sampler_info {};
 

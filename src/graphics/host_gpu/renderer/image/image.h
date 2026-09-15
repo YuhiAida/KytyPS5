@@ -47,7 +47,10 @@ struct ImageBinding {
 
 class Image final {
 public:
-	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);
+	// host_scale_x/y scale the host backing extent relative to the guest extent (render scale).
+	// Guest metadata (address layout, pitch, tiling) stays untouched.
+	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info,
+	      float host_scale_x = 1.0f, float host_scale_y = 1.0f);
 	~Image();
 	KYTY_CLASS_NO_COPY(Image);
 
@@ -140,6 +143,8 @@ public:
 
 	ImageInfo        info;
 	VulkanImage      backing;
+	float            host_scale_x = 1.0f;
+	float            host_scale_y = 1.0f;
 	std::vector<CachedImageView> views;
 	ImageUsage       usage;
 	ImageBinding     binding;
@@ -153,6 +158,17 @@ public:
 
 private:
 	friend struct ImageTestAccess;
+
+	// Guest-extent transfers against a scaled backing have to be resampled, not clamped: the
+	// staging image carries the data at the guest extent and a blit converts between the two.
+	void UploadDirect(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
+	                  uint64_t size);
+	void DownloadDirect(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer,
+	                    uint64_t offset, uint64_t size);
+	[[nodiscard]] bool ResampleUpload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer,
+	                                  uint64_t offset, uint64_t size);
+	[[nodiscard]] bool ResampleDownload(std::span<const vk::BufferImageCopy> copies,
+	                                    vk::Buffer buffer, uint64_t offset, uint64_t size);
 
 	[[nodiscard]] static vk::ImageAspectFlags FullAspectMask(vk::Format format) noexcept;
 	[[nodiscard]] static uint32_t             CopyRows(uint64_t row_size, uint32_t rows,
