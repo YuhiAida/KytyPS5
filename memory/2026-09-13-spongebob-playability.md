@@ -793,3 +793,25 @@ proven unscalable on this GPU
 - Path to 30 fps, honestly: the per-draw cost is ~41 us at ~900 draws/frame. Halving it gives
   ~16 fps; 30 fps needs the per-draw state pipeline to change shape (memoised snapshots handed out
   by pointer/shared ownership, batching, or GPU-side state), not another local optimisation.
+
+## Iteration 50 - upstream merge (28 commits) and the mesh-decode crash it caused
+- Merged `origin/main` (28 commits) into the playability line (`5ea610c`); conflicts in
+  `renderDraw.cpp` (3), `pipelineCache.cpp` (3), `ShaderRecompiler.cpp` (1), all resolved by taking
+  upstream's shape (vertex_info array, `PrepareGraphicsBindings(span)`, tessellation programs) and
+  re-applying the `GpuPhaseStats` timers. Pre-merge tip kept as tag `wip/pre-upstream-merge-2026-09-15`.
+- First run of the merged build died after ~3 s: `unknown RDNA2 instruction family at pc 0x0000023c,
+  raw=0xd2f2c70f` (ShaderDecoder.cpp:391), on mesh shader hash 0xcecebe366631f558 (front 184 words,
+  back 504). Pre-merge that same hash compiled 22-24x; merged decoded 0 instructions.
+- Cause: upstream's new `Decoder::DecodeFrontProgram` stops only on `s_setpc_b64`, but the
+  merged-stage ABI hands the back shader over as either `s_setpc_b64 s[6:7]` or
+  `s_swappc_b64 null, s[6:7]`; the mesh front program was decoded past its end into the words that
+  follow it. The pre-merge local loop accepted both opcodes (same fix lives on
+  `fix/spongebob-shader-desync`).
+- Fix `7eccb87` (ShaderDecoder.cpp): accept either opcode in the loop and in the trailing EXIT_IF.
+  Verified: that hash decodes 335 instructions (identical to pre-merge), 24 MS compiles, no abort,
+  37 present dumps in 120 s, menu renders with textures at 61 fps.
+- Open question: upstream's tessellation path (Local/HS/TES, `Tessellation.cpp`) is now in this tree
+  but unverified - no game here has been shown to exercise it.
+- Branch state: `fix/spongebob-playability` fast-forwarded to `7eccb87`. Every other local branch is
+  either already contained in it (patch-equivalent) or based on the stale divergent local `main`
+  (714 behind `origin/main`) - nothing else needed the merge.
