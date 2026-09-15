@@ -513,9 +513,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		                                 .count());
 	};
 
-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " code_words=%" PRIu64 " decode\n",
+	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " code_words=%" PRIu64
+	     " back_words=%" PRIu64 " decode\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
-	     static_cast<uint64_t>(code.size()));
+	     static_cast<uint64_t>(code.size()), static_cast<uint64_t>(options.back_code.size()));
 
 	Decoder::Program decoded;
 	std::vector<uint32_t> joined_code;
@@ -619,7 +620,9 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	result.program = std::move(ir);
 	if (options.dump_ir) {
 		result.decoded_dump = std::move(decoded_dump);
-		result.cfg_dump     = CFG::GraphToString(cfg);
+	}
+	if (options.dump_ir || options.dump_cfg) {
+		result.cfg_dump = CFG::GraphToString(cfg);
 	}
 	return result;
 }
@@ -660,6 +663,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		result.decoded_dump = std::move(translated.decoded_dump);
 		result.ir_dump      = std::move(ir_dump);
 	}
+	result.cfg_dump = std::move(translated.cfg_dump);
 	return result;
 }
 
